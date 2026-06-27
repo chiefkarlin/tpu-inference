@@ -58,7 +58,7 @@ spec:
               - sh
               - -c
               - |
-                bash /workspace/vllm/examples/online_serving/multi-node-serving.sh leader --ray_cluster_size=$(LWS_GROUP_SIZE);
+                ray start --head --port=6379;
                 python3 -m vllm.entrypoints.openai.api_server \
                   --host 0.0.0.0 --port 8000 --seed 42 \
                   --tensor-parallel-size 8 --data-parallel-size 1 \
@@ -69,7 +69,7 @@ spec:
                   --dtype bfloat16 --trust-remote-code \
                   --gpu-memory-utilization 0.9 \
                   --enable-expert-parallel \
-                  --disable-log-requests
+                  --no-enable-log-requests
             env:
               - name: HUGGING_FACE_HUB_TOKEN
                 valueFrom:
@@ -94,6 +94,19 @@ spec:
             resources:
               limits:
                 google.com/tpu: "4"
+            readinessProbe:
+              httpGet:
+                path: /health
+                port: 8000
+              initialDelaySeconds: 300
+              periodSeconds: 10
+              failureThreshold: 60
+            startupProbe:
+              tcpSocket:
+                port: 8000
+              initialDelaySeconds: 60
+              periodSeconds: 30
+              failureThreshold: 360
             volumeMounts:
               - mountPath: /dev/shm
                 name: dshm
@@ -112,13 +125,6 @@ spec:
           - name: jax-cache
             emptyDir:
               sizeLimit: 20Gi
-        readinessProbe:
-          httpGet:
-            path: /health
-            port: 8000
-          initialDelaySeconds: 300
-          periodSeconds: 10
-          failureThreshold: 60
     workerTemplate:
       spec:
         nodeSelector:
@@ -136,10 +142,12 @@ spec:
               - sh
               - -c
               - |
-                until bash /workspace/vllm/examples/online_serving/multi-node-serving.sh worker --ray_address=$(LWS_LEADER_ADDRESS); do
+                until ray start --address=${LWS_LEADER_ADDRESS}:6379; do
                   echo 'Waiting for leader Ray head...';
                   sleep 10;
-                done
+                done;
+                echo 'Connected to Ray cluster. Worker ready.';
+                sleep infinity
             env:
               - name: HUGGING_FACE_HUB_TOKEN
                 valueFrom:
