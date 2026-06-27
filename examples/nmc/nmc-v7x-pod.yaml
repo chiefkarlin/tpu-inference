@@ -45,7 +45,7 @@ spec:
 
   containers:
     - name: nmc-server
-      image: <GAR_IMAGE>  # e.g. us-central1-docker.pkg.dev/<project>/nmc/nmc-inference:latest
+      image: gcr.io/northam-ce-mlai-tpu/nmc-inference:latest
       imagePullPolicy: Always
       # Uses Docker ENTRYPOINT (/entrypoint.sh) which runs:
       #   exec python3 -m vllm.entrypoints.openai.api_server ${VLLM_ARGS:-}
