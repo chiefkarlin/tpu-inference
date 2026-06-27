@@ -85,17 +85,31 @@ spec:
         # Cache compiled XLA artifacts to speed up restarts.
         - name: VLLM_XLA_CACHE_PATH
           value: /tmp/jax_cache
-        # --- Profiling (uncomment to capture traces) ---
-        # JAX profiler server for ML Diagnostics / xprof remote capture.
+        # --- Profiling ---
+        # Three approaches (see docs/north-mini-code/EXECUTION_RUNBOOK.md §6):
+        #
+        # A) Offline: use a separate pod with tpu_profiling.py (recommended).
+        #    No env vars needed — the script sets profiler_config programmatically.
+        #
+        # B) Serving API: add these to VLLM_ARGS to enable /start_profile,
+        #    /stop_profile HTTP endpoints:
+        #      --profiler torch --torch-profiler-dir /tmp/profiles
+        #    Then: curl -X POST http://<pod>:8000/start_profile
+        #          ... send requests ...
+        #          curl -X POST http://<pod>:8000/stop_profile
+        #
+        # C) JAX profiler server: uncomment for remote xprof capture.
+        #    Then kubectl port-forward <pod> 9999:9999 and connect with xprof.
         # - name: USE_JAX_PROFILER_SERVER
         #   value: "true"
         # - name: JAX_PROFILER_SERVER_PORT
         #   value: "9999"
-        # Auto-capture a trace of decode steps 10-20.
-        # - name: JAX_TRACE_START_GPU
-        #   value: "10"
-        # - name: JAX_TRACE_STOP_GPU
-        #   value: "20"
+        #
+        # After capturing, download the trace:
+        #   kubectl cp <pod>:/tmp/profiles ./nmc-profiles
+        # Then analyze:
+        #   pip install tensorflow pandas
+        #   python3 examples/nmc/analyze_nmc_trace.py <xplane.pb> --output report.md
       ports:
         - containerPort: 8000
       resources:
