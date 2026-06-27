@@ -23,18 +23,17 @@ steps:
       echo "vLLM LKG: $(cat /workspace/vllm_lkg.txt)"
 
   # Build the Docker image.
+  # NOTE: use `script` (not `args`) so that $(cat ...) shell expansion works —
+  # Cloud Build `args` are passed to the docker entrypoint without a shell.
   - name: 'gcr.io/cloud-builders/docker'
     id: 'build'
     waitFor: ['read-lkg']
-    args:
-      - 'build'
-      - '-f'
-      - 'docker/Dockerfile'
-      - '--build-arg'
-      - 'VLLM_COMMIT_HASH=$(cat /workspace/vllm_lkg.txt)'
-      - '-t'
-      - '$_GAR_IMAGE'
-      - '.'
+    script: |
+      docker build \
+        -f docker/Dockerfile \
+        --build-arg VLLM_COMMIT_HASH=$(cat /workspace/vllm_lkg.txt) \
+        -t $_GAR_IMAGE \
+        .
 
   # Push to GAR (Cloud Build auto-pushes images listed in 'images', but
   # explicit push gives better logging).

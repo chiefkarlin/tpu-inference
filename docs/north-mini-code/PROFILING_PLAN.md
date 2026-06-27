@@ -86,44 +86,67 @@ At ctx=256K: full layers read 256K×2KB=512MB each → 13×512=6,656MB + 36×8=2
 
 ### 3c. Per-chip estimates (TP=4, weights sharded 1/4)
 
-| Component             | Per-chip (TP=4) | Notes |
-|-----------------------|-----------------|-------|
-| MoE weights           | ~906 MB         | 3,624 MB / 4 (GMM_TP shards F/intermediate dim: GMM1 col-parallel on 2F, GMM2 row-parallel on F) |
-| Attention weights     | ~334 MB         | 1,338 MB / 4 |
-| Dense MLP             | ~9 MB           | 37 MB / 4 |
-| LM head               | ~1,074 MB       | Replicated (vocab dim not sharded with TP=4) or sharded |
-| KV cache (4K ctx)     | ~392 MB         | kv_heads=1 per process (not sharded further) |
-| **Total per-chip**    | **~2,719 MB**   | At 4K context |
+**Verified per-chip decode HBM read** (code-traced through fused_moe_gmm.py:393-394
+w1_spec/w2_spec, cohere2_attention.py projections, embed sharding P("model",None),
+gmm_v2 IndexMaps group-skipping → only 8/128 active experts read):
 
-> **Caveat:** LM head sharding depends on model implementation. If vocab-parallel
-> (sharded across TP), per-chip = 1,074/4 = 268 MB. If replicated, 1,074 MB.
-> This is the single largest decode cost component — verify in trace.
+| Component                    | Per-chip (TP=4) | Calculation |
+|------------------------------|-----------------|-------------|
+| MoE GMM1 (8 active experts)  | 12.6 MiB/layer  | 8 × (2048 × 384 × 2B) — col-parallel, 2F/TP=384 |
+| MoE GMM2 (8 active experts)  | 6.3 MiB/layer   | 8 × (192 × 2048 × 2B) — row-parallel, F/TP=192, all-reduce |
+| MoE router                   | 0.5 MiB/layer   | (2048 × 128 × 2B) — replicated |
+| MoE subtotal (48 layers)     | **930 MiB**     | (12.6+6.3+0.5) × 48 |
+| Attention Q proj             | 4 MiB/layer     | (2048 × 8×128 × 2B) — N/TP=8 heads |
+| Attention K proj             | 0.5 MiB/layer   | (2048 × 1×128 × 2B) — K/TP=1 head |
+| Attention V proj             | 0.5 MiB/layer   | same as K |
+| Attention O proj             | 4 MiB/layer     | (8×128 × 2048 × 2B) — N/TP=8 heads |
+| Attn subtotal (49 layers)    | **441 MiB**     | 9 × 49 |
+| Dense MLP (layer 0, replic.) | 36 MiB          | (2048×3072 + 2048×3072 + 3072×2048) × 2B — P() unsharded |
+| LM head (tied, vocab/TP)     | 256 MiB         | (262144/4 × 2048 × 2B) — embed sharded P("model",None) |
+| KV cache sliding (36 layers) | 72 MiB          | 36 × 4096 × (1×128×2×2B) = 36 × 2 MiB — 1 kv-head/chip |
+| KV cache full (13 layers)    | 52 MiB          | 13 × 8192 × 512B = 13 × 4 MiB — at ctx=8192 |
+| RMSNorms (49 × 1 norm)       | <1 MiB          | 49 × 2048 × 2B — negligible |
+| **Total per-chip (ctx=8192)**| **~1,787 MiB**  | 930+441+36+256+72+52 ≈ 1.75 GiB |
 
-### 3d. Theoretical minimum decode latency (TP=4, per-chip, 4K ctx)
+> **Key corrections vs prior estimate (2,719 MB):**
+> 1. KV cache: was 392 MB (used 4 kv_heads) → now 124 MB (1 kv-head/chip, TP=4).
+> 2. LM head: was 1,074 MB (assumed replicated) → now 256 MB (TP-sharded on vocab).
+> 3. Attention: was 334 MB (QKV 2× error) → now 441 MB (9 MiB × 49 layers).
+> 4. MoE: was 906 MB → now 930 MB (added 0.5 MiB router/layer, was slightly under).
+
+### 3d. Theoretical minimum decode latency (TP=4, per-chip, ctx=8192)
 
 ```
-HBM read per chip ≈ 2,719 MB = 2.719 GB
+HBM read per chip ≈ 1,787 MiB = 1.874 GB
 HBM BW per chip = 7.4 TB/s (Ironwood, confirmed from tpu_specs.json)
-T_min ≈ 2.719 GB / 7.4 TB/s ≈ 0.37 ms/token
+T_min ≈ 1.874 GB / 7.4 TB/s ≈ 0.253 ms/token
 ```
 
-Target decode throughput: ~2,700 tok/s (if HBM-bound at 0.37 ms/tok).
+Target decode throughput: ~3,950 tok/s (if HBM-bound at 0.253 ms/tok).
 **Actual will be higher** due to: DMA/compute non-overlap, MoE dispatch
-overhead, router compute, normalization, sampling, and inter-chip collectives.
+overhead, router compute, normalization, sampling, and inter-chip collectives
+(48 AllReduces for GMM2 + 49 for O-proj, each ~4 KiB — negligible BW but adds latency).
+
+> At ctx=4096 (shorter context): full-layer KV = 13 × 2 MiB = 26 MiB (vs 52).
+> Total ≈ 1,761 MiB → T_min ≈ 0.249 ms (minimal change — weights dominate).
+> At ctx=32768: full-layer KV = 13 × 16 MiB = 208 MiB → total ≈ 1,943 MiB → 0.275 ms.
+> At ctx=262144 (max): full-layer KV = 13 × 128 MiB = 1,664 MiB → total ≈ 3,399 MiB → 0.481 ms.
 
 ### 3e. Prefill theoretical minimums (compute-bound)
 
-Prefill is compute-bound (MXU). For prompt length P tokens:
-- MoE FLOPs/token: 2 × 8 × (2048×1536 + 768×2048) = 75.5 MFLOP
+Prefill is compute-bound (MXU) for sufficiently long prompts. For prompt length P:
+- MoE FLOPs/token: 2 × 8 × (2048×1536 + 768×2048) = 75.5 MFLOP (8 active experts)
 - Attention FLOPs/token (approx): 4 × 2048 × 128 × num_kv_heads ≈ 4.2 MFLOP (QK+AV per layer)
 - 48 MoE layers + 49 attn layers: ~3.8 GFLOP/token (weights) + ~0.2 GFLOP (attn)
 - Total: ~4.0 GFLOP/token
 - For P=1024: 4.1 TFLOP, at 2,157 TFLOP/s/chip × 4 chips = 8,628 TFLOP/s → T_min ≈ 0.48 ms
 - But prefill is also HBM-bound for weight reads (same weights regardless of P):
-  HBM = 2.719 GB/chip, same as decode → ~0.37 ms floor.
+  HBM = 1.874 GB/chip (per §3c) → ~0.25 ms floor.
+- At P=1024: compute (0.48 ms) > HBM (0.25 ms) → compute-bound.
+- Crossover at P ≈ 530 tokens (where 4.0 GFLOP/token × P / 8628 TFLOP/s = 0.25 ms).
 
-> For short prompts (P < ~256), prefill is HBM-bound (same as decode).
-> For long prompts (P > ~1024), prefill becomes compute-bound.
+> For short prompts (P < ~530), prefill is HBM-bound (same as decode).
+> For long prompts (P > ~530), prefill becomes compute-bound.
 
 ---
 
@@ -163,27 +186,30 @@ steps 10-20 automatically.
 ### 4c. Kernels of interest (priority order)
 
 1. **MoE GMM (gmm_v2):** gate/up + down GEMMs. Decode is HBM-bound (weight read).
-   - Theoretical: 72 MB/layer/token (8 experts, full model). 
+   - Theoretical: 18.9 MiB/layer/chip (8 active experts, TP=4: GMM1 12.6 + GMM2 6.3 MiB).
+   - gmm_v2 group-skipping (IndexMaps L256 gm_id_to_group_id): only experts with
+     tokens are iterated → 8/128 experts read, not all 128. Verified in code.
    - Check: achieved HBM BW, DMA/compute overlap, expert dispatch overhead.
    - Block sizes: capture calculate_tiling output (tile_m, tile_k, tile_n).
    - Bottleneck hypothesis: small intermediate=768 → small tile_n → MXU
      underutilization in compute-bound (prefill) regime.
 
 2. **RPA v3 attention (sliding layers):** decode with sw=4096.
-   - Theoretical KV read: 4096 × 2KB = 8 MB/layer/token.
-   - Check: effective KV fetched (should be ≤ sw tokens, not bkv_sz).
+   - Theoretical KV read: 4096 × 512B = 2 MiB/layer/chip (1 kv-head, TP=4).
+   - Kernel CLAMPS to sw internally (kernel.py L388-391 decode, L939-948 prefill).
+   - Check: effective KV fetched (should be ≤ sw tokens, confirmed by code).
    - Check: bkv_double_buf VMEM usage (bkv_sz × kv_dim × 2 buffers).
-   - With default bkv_sz=8192: VMEM for 8192 tokens allocated but only 4096 used.
-   - With tuned bkv_sz=4096: 50% VMEM savings, same HBM read.
+   - With tuned d_block_sizes=(1,4096,1,2048): bkv_sz=4096 (one full sw),
+     bkv_csz=2048 (2 compute passes) — 50% VMEM savings vs default bkv_sz=8192.
 
 3. **RPA v3 attention (full layers):** decode with no sw.
-   - Theoretical KV read: ctx × 2KB. Grows with context length.
-   - Check: bkv_csz VMEM pressure at long contexts (256K → 512 MB KV read).
-   - This is the dominant cost at long context — verify HBM BW achieved.
+   - Theoretical KV read: ctx × 512B/layer/chip. At ctx=8192: 4 MiB/layer.
+   - Grows with context: at 256K ctx → 128 MiB/layer → 1,664 MiB total (dominant).
+   - Check: bkv_csz VMEM pressure at long contexts.
 
 4. **LM head (tied embedding):** decode vocab projection.
-   - Theoretical: 1,074 MB weight read (full) or ~268 MB (TP-sharded).
-   - This may be the single largest decode cost — verify in trace.
+   - Theoretical: 256 MiB/chip (vocab/TP=65536 × 2048 × 2B, TP-sharded P("model",None)).
+   - Second-largest decode cost after MoE weights (930 MiB). Verify in trace.
    - Check: is it GEMM (efficient) or gather (inefficient)?
 
 5. **Router / top-k selection:** MoE gating.

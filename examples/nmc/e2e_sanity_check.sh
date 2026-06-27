@@ -39,18 +39,30 @@ curl -s "http://${HOST}:${PORT}/v1/models" | python3 -m json.tool 2>/dev/null ||
 echo ""
 
 # 3. Short coding prompt (completions API)
+# NOTE: build the JSON body via python3 -c to avoid shell-quote-breaking bugs
+# (a prompt containing unescaped " would corrupt the -d JSON string).
 echo "--- 3. Completions API: coding prompt ---"
 PROMPT='def fibonacci(n):\n    """Return the nth Fibonacci number."""\n    '
-RESPONSE=$(curl -s "http://${HOST}:${PORT}/v1/completions" \
-    -X POST \
-    -H "Content-Type: application/json" \
-    -d "{
-        \"model\": \"${MODEL}\",
-        \"prompt\": \"${PROMPT}\",
-        \"max_tokens\": 64,
-        \"temperature\": 0.0,
-        \"stop\": [\"\\n\\n\"]
-    }")
+RESPONSE=$(python3 -c "
+import json, urllib.request
+body = json.dumps({
+    'model': '${MODEL}',
+    'prompt': '''${PROMPT}''',
+    'max_tokens': 64,
+    'temperature': 0.0,
+    'stop': ['\n\n'],
+}).encode()
+req = urllib.request.Request(
+    'http://${HOST}:${PORT}/v1/completions',
+    data=body,
+    headers={'Content-Type': 'application/json'},
+    method='POST')
+try:
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        print(resp.read().decode())
+except urllib.error.HTTPError as e:
+    print(e.read().decode())
+")
 
 echo "  Response:"
 echo "${RESPONSE}" | python3 -m json.tool 2>/dev/null || echo "${RESPONSE}"
