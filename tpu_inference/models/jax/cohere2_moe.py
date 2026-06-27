@@ -207,7 +207,11 @@ class Cohere2MoeSparseMoeBlock(JaxModule):
             dtype=dtype,
             num_local_experts=config.num_experts,
             hidden_size=config.hidden_size,
-            intermediate_size_moe=config.moe_intermediate_size,
+            # NOTE: Cohere2 names the *expert* intermediate size
+            # ``intermediate_size`` (768) and the dense layer-0 intermediate
+            # ``prefix_dense_intermediate_size`` (3072) — the inverse of
+            # Qwen3MoE, which uses ``moe_intermediate_size`` for experts.
+            intermediate_size_moe=config.intermediate_size,
             hidden_act=config.hidden_act,
             rngs=rng,
             router=self.gate,
@@ -267,6 +271,17 @@ class Cohere2DecoderLayer(JaxModule):
                  prefix: str = ""):
         hidden_size = config.hidden_size
         rms_norm_eps = config.rms_norm_eps
+        # ``first_k_dense_replace`` is the only reliable signal for the
+        # dense layer 0: ``layer_types`` cannot distinguish it from the
+        # other ``full_attention`` MoE layers (layers 4, 8, ... are also
+        # ``full_attention``). On the actual serving path (NMC's HF repo
+        # has no Python files and transformers has no Cohere2MoeConfig, so
+        # vLLM loads a generic PretrainedConfig that stores every kwarg as
+        # a plain attribute) this ``getattr`` returns 1 → layer 0 is dense.
+        # NOTE: a future transformers version adding Cohere2MoeConfig could
+        # ``pop`` first_k_dense_replace in __post_init__ (using it only to
+        # derive mlp_layer_types) without storing it; that latent risk is
+        # not on the current path and is left as a defensive follow-up.
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
         # The dense layer 0 forces RoPE when the prefix pattern is 1
         # (a full dense layer followed by sliding layers).
@@ -327,11 +342,18 @@ class Cohere2DecoderLayer(JaxModule):
 
         # --- MLP (dense for layer 0, MoE for the rest) ---
         if self.is_dense:
+            # The dense layer 0 uses ``prefix_dense_intermediate_size``
+            # (3072), NOT ``intermediate_size`` (which is the *expert*
+            # intermediate = 768 in Cohere2). Fall back to intermediate_size
+            # for configs that do not define the dense-specific field.
+            dense_intermediate = getattr(
+                config, "prefix_dense_intermediate_size",
+                config.intermediate_size)
             self.mlp = Cohere2MLP(
                 dtype=dtype,
                 hidden_act=config.hidden_act,
                 hidden_size=hidden_size,
-                intermediate_size=config.intermediate_size,
+                intermediate_size=dense_intermediate,
                 activation_ffw_td=P(ShardingAxisName.MLP_DATA, None),
                 random_init=False,
                 quant_config=quant_config,
@@ -526,7 +548,7 @@ class Cohere2MoeForCausalLM(JaxModule, LoadableWithIterator):
         hf_config = model_config.hf_config
         self.logit_scale = getattr(hf_config, "logit_scale", 1.0)
         self.tie_word_embeddings = getattr(hf_config, "tie_word_embeddings",
-                                           False)
+                                           True)
 
         self.model = Cohere2MoeModel(
             vllm_config=vllm_config,
