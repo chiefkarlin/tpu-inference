@@ -1,0 +1,133 @@
+# Kubernetes pod manifest for NMC inference on v7x-4 single-host-vllm.
+#
+# Usage:
+#   1. Create HF token secret:
+#      kubectl create secret generic hf-token-secret \
+#        --from-literal=token=$HF_TOKEN
+#   2. Update IMAGE below to your GAR path.
+#   3. kubectl apply -f nmc-v7x-pod.yaml
+#
+# The pod starts a vLLM OpenAI-compatible API server serving NMC.
+# Send a test request once healthy:
+#   curl http://<pod-ip>:8000/v1/completions -X POST \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"CohereLabs/North-Mini-Code-1.0","prompt":"def hello():","max_tokens":32,"temperature":0}'
+#
+# TP topology: v7x-4 = 4 chips (2x2x1), 2 cores/chip = 8 cores.
+# TP=4 → 4 JAX processes (1 chip each). NMC has 4 kv_heads → 4/4=1 per process.
+# vLLM's TPU executor auto-distributes chips; no TPU_VISIBLE_CHIPS needed
+# for standard TP (only needed for multi-process DP or pipeline parallelism).
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nmc-v7x-inference
+  labels:
+    app: nmc-v7x-inference
+spec:
+  # Schedule on the single-host-vllm node pool with v7x-4 topology.
+  nodeSelector:
+    cloud.google.com/gke-tpu-accelerator: tpu7x
+    cloud.google.com/gke-tpu-topology: 2x2x1  # 4 chips = v7x-4
+
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: cloud.google.com/gke-nodepool
+                operator: In
+                values:
+                  - single-host-vllm
+
+  restartPolicy: Never
+
+  containers:
+    - name: nmc-server
+      image: <GAR_IMAGE>  # e.g. us-central1-docker.pkg.dev/<project>/nmc/nmc-inference:latest
+      imagePullPolicy: Always
+      # Uses Docker ENTRYPOINT (/entrypoint.sh) which runs:
+      #   exec python3 -m vllm.entrypoints.openai.api_server ${VLLM_ARGS:-}
+      # So we pass all vLLM args via the VLLM_ARGS env var.
+      env:
+        - name: HUGGING_FACE_HUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token-secret
+              key: token
+        # --- vLLM serving args (consumed by entrypoint.sh) ---
+        - name: VLLM_ARGS
+          value: >-
+            --model CohereLabs/North-Mini-Code-1.0
+            --port 8000
+            --tensor-parallel-size 4
+            --dtype bfloat16
+            --trust-remote-code
+            --max-model-len 8192
+            --max-num-seqs 8
+            --max-num-batched-tokens 1024
+            --no-enable-prefix-caching
+            --gpu-memory-utilization 0.9
+            --seed 42
+        # --- JAX/TPU environment ---
+        # MODEL_IMPL_TYPE=auto tries flax_nnx first, falls back to vllm if
+        # architecture unregistered. NMC needs flax_nnx (Kernel Eng's K-3).
+        # - name: MODEL_IMPL_TYPE
+        #   value: "flax_nnx"
+        # NEW_MODEL_DESIGN=False (default) uses 2D mesh — required by the MoE
+        # kernel. Leave unset for initial bring-up.
+        # Skip precompilation to speed up startup (compile on first request).
+        - name: SKIP_JAX_PRECOMPILE
+          value: "1"
+        - name: VLLM_XLA_CHECK_RECOMPILATION
+          value: "0"
+        # Cache compiled XLA artifacts to speed up restarts.
+        - name: VLLM_XLA_CACHE_PATH
+          value: /tmp/jax_cache
+        # --- Profiling (uncomment to capture traces) ---
+        # JAX profiler server for ML Diagnostics / xprof remote capture.
+        # - name: USE_JAX_PROFILER_SERVER
+        #   value: "true"
+        # - name: JAX_PROFILER_SERVER_PORT
+        #   value: "9999"
+        # Auto-capture a trace of decode steps 10-20.
+        # - name: JAX_TRACE_START_GPU
+        #   value: "10"
+        # - name: JAX_TRACE_STOP_GPU
+        #   value: "20"
+      ports:
+        - containerPort: 8000
+      resources:
+        requests:
+          google.com/tpu: 4  # 4 chips
+        limits:
+          google.com/tpu: 4
+      # Model weight cache: avoid re-downloading 61GB on pod restart.
+      # Uses emptyDir (lost on pod death). For persistence, replace with PVC.
+      volumeMounts:
+        - name: hf-cache
+          mountPath: /root/.cache/huggingface
+        - name: jax-cache
+          mountPath: /tmp/jax_cache
+        - name: dshm
+          mountPath: /dev/shm
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 8000
+        initialDelaySeconds: 300  # weight download (61GB) + compile takes time
+        periodSeconds: 10
+        failureThreshold: 60  # allow up to 10 min startup
+
+  volumes:
+    - name: hf-cache
+      emptyDir:
+        sizeLimit: 100Gi  # 61GB weights + buffer
+    - name: jax-cache
+      emptyDir:
+        sizeLimit: 20Gi
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 8Gi
