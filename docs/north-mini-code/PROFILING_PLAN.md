@@ -231,20 +231,47 @@ The `accelerator-agents/MaxKernel` toolkit provides offline xplane.pb analysis:
   - `lines (id, plane_id, display_id, name, timestamp_ns)` — trace lines/streams
   - `events (plane_id, line_id, name, offset_ps, duration_ps, start_ps, end_ps)` — kernel/DMA events
 
+  All time columns in picoseconds (÷1e9 → ms, ÷1e6 → µs). Event names resolved
+  from `plane.event_metadata[event.metadata_id].name`. DMA transfer *sizes* are
+  NOT stored — only durations. `get_hlo_dump()` is a non-functional stub.
+
   Example queries:
   ```sql
-  -- Top-10 longest kernel events
-  SELECT name, COUNT(*) as calls, AVG(duration_ps)/1e6 as avg_ms
-  FROM events GROUP BY name ORDER BY AVG(duration_ps) DESC LIMIT 10;
+  -- Top-30 ops by total duration (the primary analysis query)
+  SELECT name, COUNT(*) AS num_calls, SUM(duration_ps) AS total_ps,
+         AVG(duration_ps) AS avg_ps, MAX(duration_ps) AS max_ps
+  FROM events GROUP BY name ORDER BY total_ps DESC LIMIT 30;
 
-  -- Total time in RPA attention kernels
-  SELECT SUM(duration_ps)/1e6 as total_ms FROM events
-  WHERE name LIKE '%ragged_paged_attention%';
+  -- RPA v3 attention: scope name = RPA{D|P|M}-p_{ps}-bq_{bq}_{bqcsz}-bkv_{bkv}_{bkvcsz}[-sw_{sw}]
+  SELECT name, COUNT(*), SUM(duration_ps) AS total_ps, AVG(duration_ps) AS avg_ps
+  FROM events WHERE name LIKE '%RPA%' OR name LIKE '%ragged_paged%'
+  GROUP BY name ORDER BY total_ps DESC;
 
-  -- MoE GMM kernel timings
-  SELECT name, COUNT(*), SUM(duration_ps)/1e6 as total_ms
-  FROM events WHERE name LIKE '%gmm%' GROUP BY name;
+  -- MoE GMM kernels
+  SELECT name, COUNT(*), SUM(duration_ps) AS total_ps
+  FROM events WHERE name LIKE '%gmm%' OR name LIKE '%moe%'
+  GROUP BY name ORDER BY total_ps DESC;
   ```
+
+- **Compute vs memory ratio** (`tools/analyze_profile.py::analyze_trace(path)`):
+  Uses `xprof.convert.raw_to_tool_data` to get Chrome-trace JSON, finds
+  `/device:TPU:0` plane, takes the analysis window as the last two
+  `jit_computation` events, sums `dur` of all `SyncWait` events in that window.
+  **ratio = SyncWait_total / computation_window**. ratio > 0.5 = memory-bound;
+  < 0.3 = compute-bound. This is the key "is this kernel HBM-bound?" metric.
+  NOTE: no actual DMA byte counts are extracted — only stall *time*.
+
+- **Per-kernel timing** (`evaluation/xprof_utils.py::extract_xprof_time`):
+  Globs `**/*.xplane.pb`, inspects `/device:TPU:0` planes, lines named
+  "XLA Modules" or "XLA Ops", averages `duration_ps` over `num_runs`.
+
+- **Overview metrics** (`get_overview_page_metrics`): JSON with
+  device_count, total_duration_ms, device_duty_cycle_percent (rough),
+  average_step_time_ms, step_count.
+
+- **Ready-to-run analysis script**: `examples/nmc/analyze_nmc_trace.py` —
+  combines all the above into a single markdown report. Run inside the Docker
+  container: `python3 examples/nmc/analyze_nmc_trace.py <xplane.pb> -o report.md`
 
 - **MaxKernel HITL agent** (`run_hitl_agent.sh`): interactive agent with
   ProfileAgentOrchestrator for DMA/memory transfer analysis, compute vs memory
@@ -253,6 +280,7 @@ The `accelerator-agents/MaxKernel` toolkit provides offline xplane.pb analysis:
 - **JAXBench** (`python -m JAXBench evaluate`): empirical kernel benchmarking
   against baselines. Returns median_ms, tflops, utilization_pct, speedup_vs_baseline.
   Can be used to benchmark individual NMC kernels (MoE GMM, RPA) in isolation.
+  NOTE: no JAX/libtpu in the mgmt pod — JAXBench runs on the TPU cluster image.
 
 ---
 
