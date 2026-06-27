@@ -17,6 +17,11 @@
 # TP=4 → 4 JAX processes (1 chip each). NMC has 4 kv_heads → 4/4=1 per process.
 # vLLM's TPU executor auto-distributes chips; no TPU_VISIBLE_CHIPS needed
 # for standard TP (only needed for multi-process DP or pipeline parallelism).
+#
+# CRITICAL: 2x2x2 topology is a MULTI-HOST slice (2 hosts × 4 chips) requiring
+# LWS (LeaderWorkerSet) + Ray coordination. A single Pod CANNOT use 2x2x2 —
+# TPU init fails with "Expected 2 worker addresses, got 1". Must use 2x2x1
+# (single-host-vllm pool) for single-Pod deployment.
 
 ---
 apiVersion: v1
@@ -26,7 +31,8 @@ metadata:
   labels:
     app: nmc-v7x-inference
 spec:
-  # Schedule on the single-host-vllm node pool with v7x-4 topology.
+  # Schedule on the single-host-vllm node pool with v7x-4 topology (2x2x1).
+  # 2x2x2 (multi-host) requires LWS+Ray and cannot be used with a single Pod.
   nodeSelector:
     cloud.google.com/gke-tpu-accelerator: tpu7x
     cloud.google.com/gke-tpu-topology: 2x2x1  # 4 chips = v7x-4
@@ -71,6 +77,9 @@ spec:
             --gpu-memory-utilization 0.9
             --seed 42
         # --- JAX/TPU environment ---
+        # For 2x2x1 (single-host), the TPU runtime auto-detects. Do NOT set
+        # TPU_PROCESS_ADDRESSES, TPU_WORKER_HOSTNAMES, or TPU_MULTIHOST_BACKEND
+        # — those are for multi-host slices (2x2x2) using LWS+Ray.
         # MODEL_IMPL_TYPE=auto tries flax_nnx first, falls back to vllm if
         # architecture unregistered. NMC needs flax_nnx (Kernel Eng's K-3).
         # - name: MODEL_IMPL_TYPE
