@@ -271,17 +271,22 @@ class Cohere2DecoderLayer(JaxModule):
                  prefix: str = ""):
         hidden_size = config.hidden_size
         rms_norm_eps = config.rms_norm_eps
-        # Detect the dense layer 0. ``first_k_dense_replace`` is the HF
-        # config field, but the installed ``Cohere2MoeConfig`` (transformers
-        # >= 5.x) pops it in ``__post_init__`` to derive ``mlp_layer_types``
-        # without storing it. Fall back to ``prefix_dense_intermediate_size``
-        # (always present when a dense prefix exists) as the reliable signal.
-        if hasattr(config, "first_k_dense_replace"):
-            first_k_dense_replace = config.first_k_dense_replace
-        elif hasattr(config, "prefix_dense_intermediate_size"):
-            first_k_dense_replace = 1
+        # Detect the dense layer 0. ``Cohere2MoeConfig`` (transformers >= 5.x)
+        # pops ``first_k_dense_replace`` in ``__post_init__`` — using it only
+        # to derive ``mlp_layer_types`` — without storing it, so ``hasattr``
+        # returns False on that path. The canonical signal is therefore
+        # ``mlp_layer_types`` (a list of 'dense'/'sparse' strings that
+        # Cohere2MoeConfig.__post_init__ DOES store). Fall back to
+        # ``first_k_dense_replace`` for the generic-PretrainedConfig path
+        # (where every config kwarg is stored as a plain attribute).
+        if hasattr(config, "mlp_layer_types"):
+            mlp_layer_types = config.mlp_layer_types
+            is_dense = (layer_idx < len(mlp_layer_types)
+                        and mlp_layer_types[layer_idx] == "dense")
+        elif hasattr(config, "first_k_dense_replace"):
+            is_dense = layer_idx < config.first_k_dense_replace
         else:
-            first_k_dense_replace = 0
+            is_dense = False
         # The dense layer 0 forces RoPE when the prefix pattern is 1
         # (a full dense layer followed by sliding layers).
         prefix_dense_sliding_window_pattern = getattr(
@@ -290,7 +295,7 @@ class Cohere2DecoderLayer(JaxModule):
 
         # --- Resolve the per-layer schedule (fixed for this layer) ---
         self.layer_idx = layer_idx
-        self.is_dense = layer_idx < first_k_dense_replace
+        self.is_dense = is_dense
         if layer_types is not None and layer_idx < len(layer_types):
             layer_type = layer_types[layer_idx]
         else:
