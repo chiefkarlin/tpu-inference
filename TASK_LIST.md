@@ -41,8 +41,15 @@
 ## Phase 3: Integration & Validation (Orchestrator)
 - [x] Review & merge `feature/north-mini-code-kernels` → `feature/north-mini-code` (via perf branch merge)
 - [x] Review & merge `feature/north-mini-code-perf` → `feature/north-mini-code` (commit `12d3816a`, clean merge, 28/28 tests verified on base)
-- [ ] End-to-end NMC inference on v7x-4 with real weights (correctness sanity) — blocked on P-3 cluster creds
-- [ ] No regression on existing registered models — blocked on cluster access
+- [x] Merge EXECUTION_RUNBOOK + self-contained trace analyzer to base (commit `b5d8e2ca`)
+- [!] End-to-end NMC inference on v7x-4 with real weights (correctness sanity) — blocked on P-3 cluster creds (SOLE blocker; escalated to user 5x)
+- [!] No regression on existing registered models — blocked on cluster access
+
+## Standby Deliverables (produced while blocked on cluster creds)
+- [x] EXECUTION_RUNBOOK.md (587 lines, 10 sections) — copy-paste executable P-3→P-4 guide for any engineer with GCP access
+- [x] analyze_nmc_trace.py refactored — fully self-contained (no MaxKernel/xprof/accelerator-agents dependency)
+- [x] Build validation: 2 build bugs caught + fixed (e2e JSON quoting, cloudbuild shell expansion)
+- [x] HBM floor analysis corrected (1.87GB/chip decode, 0.25ms/token theoretical min)
 
 ## Status Legend
 - `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked
