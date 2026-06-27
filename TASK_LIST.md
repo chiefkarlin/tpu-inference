@@ -6,10 +6,12 @@
 > RPA v3 sliding-window, interleaved RoPE) already exist. Work = model integration + weight remapping
 > + wiring verification + v7x tuning. See `porting_backlog.md` / `PORTING_OVERVIEW.md`.
 
-## Worktrees
-- `/workspace/tpu-inference` — primary repo, branch `feature/north-mini-code` (Orchestrator).
-- `/workspace/nmc-kernels` — Kernel Engineer, branch `feature/north-mini-code-kernels`.
-- `/workspace/nmc-perf` — Performance Engineer, branch `feature/north-mini-code-perf`.
+## Collaboration Model (Hub mode: each agent has its own container/clone)
+- Base branch `feature/north-mini-code` on `chiefkarlin/tpu-inference` fork — holds all docs + shared work.
+- Kernel Engineer works on branch `feature/north-mini-code-kernels` (off base); pushes to fork.
+- Performance Engineer works on branch `feature/north-mini-code-perf` (off base); pushes to fork.
+- Orchestrator reviews + merges agent branches back into `feature/north-mini-code`; resolves conflicts.
+- Agents coordinate through the Orchestrator via `scion message`.
 
 ## Phase 1: Model Integration (Kernel Engineer — K-1…K-6)
 - [ ] K-1 Verify sliding-window reaches RPA v3 kernel in **decode**; wire if dropped (HIGH, correctness risk)
