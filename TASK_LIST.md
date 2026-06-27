@@ -34,10 +34,10 @@
 - [ ] Hand off compilable model to Performance Engineer
 
 ## Phase 2: v7x Bring-up & Tuning (Performance Engineer — P-1…P-4) — IN PROGRESS
-- [~] P-1 Tune fused_moe/megablox block sizes for (E=128, I=768, D=2048, topk=8) on v7x
-- [~] P-2 Tune RPA v3 block sizes for (head_dim=128, sliding_window=4096, GQA 32:4) on v7x
-- [~] P-3 GKE auth → build+push Docker to GAR → inject HF_TOKEN → kubectl run on v7x-4 / single-host-vllm
-- [ ] P-4 Capture ML Diagnostics trace + per-kernel timings; identify HBM bottlenecks
+- [x] P-1 MoE tuning inspection — **CORRECTED**: default path is GMM_TP→gmm_v2 (calculate_tiling heuristic, no tuned table). All tuned_block_sizes.py files are OFF the default path. Decision: accept heuristic for baseline; revisit tile_info wiring post-baseline if profiling proves bottleneck. See backlog §9.
+- [x] P-2 RPA v3 tuning inspection — **CORRECTED**: RPA v3 clamps KV to sliding_window internally (no over-fetch). tuned_block_sizes.py is dead code for regular path. Real lever = explicit block_sizes in custom attention module (kernel eng owns). Recommendation: bkv_csz=2048-4096. See backlog §9.
+- [!] P-3 GKE auth → build+push Docker to GAR → inject HF_TOKEN → kubectl run on v7x-4 / single-host-vllm — **BLOCKED on cluster creds** (metadata concealment; escalated to user). Perf eng proceeding with P-4 prep + Docker scaffolding + kubectl manifests in the meantime.
+- [~] P-4 Capture ML Diagnostics trace + per-kernel timings; identify HBM bottlenecks — profiling plan being drafted (no cluster access needed for plan)
 
 ## Phase 3: Integration & Validation (Orchestrator)
 - [ ] Review & merge `feature/north-mini-code-kernels` → `feature/north-mini-code`
