@@ -155,9 +155,20 @@ def general_device_put(tensor: jax.Array,
             source_mesh)
         # `t[i]` needs to be operated in the same mesh as `t`, which is provided as
         # `source_mesh`.
+        # NOTE: We use make_array_from_single_device_arrays (not
+        # make_array_from_callback) because the latter fails on multi-host when
+        # the source_mesh context (e.g. cpu_mesh) masks the TPU devices from
+        # the addressability check, raising "no addressable shards, dtype must
+        # be provided". The single-device-arrays approach explicitly enumerates
+        # addressable devices via sharding.addressable_devices_indices_map and
+        # passes dtype explicitly, which is robust to the source_mesh context.
         with ctx:
-            global_array = jax.make_array_from_callback(
-                t.shape, sharding, lambda index: t[index])
+            x_split = [
+                jax.device_put(t[i], device) for device, i in
+                sharding.addressable_devices_indices_map(t.shape).items()
+            ]
+        global_array = jax.make_array_from_single_device_arrays(
+            t.shape, sharding, x_split, dtype=t.dtype)
         if layout is not None:
             dst_mesh = sharding.mesh
             with jax.set_mesh(dst_mesh):
