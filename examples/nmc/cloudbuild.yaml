@@ -1,0 +1,61 @@
+# Cloud Build config for NMC inference image.
+#
+# Builds the Docker image from docker/Dockerfile with VLLM_COMMIT_HASH pinned
+# to the repo's LKG. Pushes to GAR.
+#
+# Usage (once GCP auth is fixed with SA key):
+#   gcloud auth activate-service-account --key-file=<key.json>
+#   gcloud config set project <GAR_PROJECT>
+#   gcloud builds submit \
+#     --config examples/nmc/cloudbuild.yaml \
+#     --substitutions=_GAR_IMAGE=us-central1-docker.pkg.dev/<project>/nmc/nmc-inference:latest \
+#     .
+#
+# This is the build path when Docker is not available locally (e.g. in a mgmt pod).
+# Cloud Build runs the build on GCP infra with a Docker daemon.
+
+steps:
+  # Read the vLLM LKG commit hash from the repo.
+  - name: 'bash'
+    id: 'read-lkg'
+    script: |
+      echo "$(cat .buildkite/vllm_lkg.version)" > /workspace/vllm_lkg.txt
+      echo "vLLM LKG: $(cat /workspace/vllm_lkg.txt)"
+
+  # Build the Docker image.
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build'
+    waitFor: ['read-lkg']
+    args:
+      - 'build'
+      - '-f'
+      - 'docker/Dockerfile'
+      - '--build-arg'
+      - 'VLLM_COMMIT_HASH=$(cat /workspace/vllm_lkg.txt)'
+      - '-t'
+      - '$_GAR_IMAGE'
+      - '.'
+
+  # Push to GAR (Cloud Build auto-pushes images listed in 'images', but
+  # explicit push gives better logging).
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push'
+    waitFor: ['build']
+    args: ['push', '$_GAR_IMAGE']
+
+# Images to push (also pushed by Cloud Build automatically).
+images:
+  - '$_GAR_IMAGE'
+
+# Default substitutions (override via --substitutions on the command line).
+substitutions:
+  _GAR_IMAGE: 'us-central1-docker.pkg.dev/REPLACE_PROJECT/nmc/nmc-inference:latest'
+
+# Large build (vLLM from source) — allow 60 minutes.
+timeout: '3600s'
+
+options:
+  # Use a larger machine for faster builds.
+  machineType: 'E2_HIGHCPU_32'
+  # Cache pip downloads between builds.
+  logging: CLOUD_LOGGING_ONLY
