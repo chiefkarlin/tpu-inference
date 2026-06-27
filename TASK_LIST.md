@@ -39,10 +39,10 @@
 - [~] P-4 Capture ML Diagnostics trace + per-kernel timings; identify HBM bottlenecks — profiling plan (307 lines) + trace analysis script ready; needs cluster access.
 
 ## Phase 3: Integration & Validation (Orchestrator)
-- [ ] Review & merge `feature/north-mini-code-kernels` → `feature/north-mini-code`
-- [ ] Review & merge `feature/north-mini-code-perf` → `feature/north-mini-code`
-- [ ] End-to-end NMC inference on v7x-4 with real weights (correctness sanity) — blocked on P-3
-- [ ] No regression on existing registered models
+- [x] Review & merge `feature/north-mini-code-kernels` → `feature/north-mini-code` (via perf branch merge)
+- [x] Review & merge `feature/north-mini-code-perf` → `feature/north-mini-code` (commit `12d3816a`, clean merge, 28/28 tests verified on base)
+- [ ] End-to-end NMC inference on v7x-4 with real weights (correctness sanity) — blocked on P-3 cluster creds
+- [ ] No regression on existing registered models — blocked on cluster access
 
 ## Status Legend
 - `[ ]` pending · `[~]` in progress · `[x]` done · `[!]` blocked
