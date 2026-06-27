@@ -1,0 +1,114 @@
+# Kubernetes pod manifest for NMC inference on v7x-4 single-host-vllm.
+#
+# Usage:
+#   1. Create HF token secret:
+#      kubectl create secret generic hf-token-secret \
+#        --from-literal=token=$HF_TOKEN
+#   2. Update IMAGE to your GAR path.
+#   3. kubectl apply -f nmc-v7x-pod.yaml
+#
+# The pod starts a vLLM OpenAI-compatible API server serving NMC.
+# Send a test request once healthy:
+#   curl http://<pod-ip>:8000/v1/completions -X POST \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"CohereLabs/North-Mini-Code-1.0","prompt":"def hello():","max_tokens":32,"temperature":0}'
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nmc-v7x-inference
+  labels:
+    app: nmc-v7x-inference
+spec:
+  # Schedule on the single-host-vllm node pool with v7x-4 topology.
+  nodeSelector:
+    cloud.google.com/gke-tpu-accelerator: tpu7x
+    cloud.google.com/gke-tpu-topology: 2x2x1  # 4 chips = v7x-4
+
+  # Co-locate all TPU chips on a single host (guaranteed by single-host topology).
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: cloud.google.com/gke-nodepool
+                operator: In
+                values:
+                  - single-host-vllm
+
+  restartPolicy: Never
+
+  # v7x-4 = 4 chips. Each chip has 2 cores.
+  # TP=4 (1 JAX process per chip, 2 cores each) → kv_heads=4/4=1 per process.
+  # TP=8 would need KV replication since 4 kv_heads % 8 != 0.
+  containers:
+    - name: nmc-server
+      image: <GAR_IMAGE>  # e.g. us-central1-docker.pkg.dev/<project>/nmc/nmc-inference:latest
+      imagePullPolicy: Always
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          exec python3 -m vllm.entrypoints.openai.api_server \
+            --model CohereLabs/North-Mini-Code-1.0 \
+            --port 8000 \
+            --tensor-parallel-size 4 \
+            --dtype bfloat16 \
+            --trust-remote-code \
+            --max-model-len 8192 \
+            --gpu-memory-utilization 0.9 \
+            --seed 42
+      env:
+        - name: HUGGING_FACE_HUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token-secret
+              key: token
+        # Skip precompilation to speed up startup (compile on first request).
+        - name: SKIP_JAX_PRECOMPILE
+          value: "1"
+        - name: VLLM_XLA_CHECK_RECOMPILATION
+          value: "0"
+        # Cache compiled XLA artifacts to speed up restarts.
+        - name: VLLM_XLA_CACHE_PATH
+          value: /tmp/jax_cache
+        # Profiling: uncomment to auto-capture a trace of steps 10-20.
+        # - name: JAX_TRACE_START_GPU
+        #   value: "10"
+        # - name: JAX_TRACE_STOP_GPU
+        #   value: "20"
+      ports:
+        - containerPort: 8000
+      resources:
+        requests:
+          google.com/tpu: 4  # 4 chips
+        limits:
+          google.com/tpu: 4
+      # Model weight cache: avoid re-downloading 61GB on pod restart.
+      # Uses emptyDir (lost on pod death). For persistence, replace with PVC.
+      volumeMounts:
+        - name: hf-cache
+          mountPath: /root/.cache/huggingface
+        - name: jax-cache
+          mountPath: /tmp/jax_cache
+        - name: dshm
+          mountPath: /dev/shm
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 8000
+        initialDelaySeconds: 300  # weight download + compile takes time
+        periodSeconds: 10
+        failureThreshold: 60  # allow up to 10 min startup
+
+  volumes:
+    - name: hf-cache
+      emptyDir:
+        sizeLimit: 100Gi  # 61GB weights + buffer
+    - name: jax-cache
+      emptyDir:
+        sizeLimit: 20Gi
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 8Gi
