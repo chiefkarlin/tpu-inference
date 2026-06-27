@@ -356,3 +356,52 @@ profiling traces, and tuned block sizes.
   `use_parallel_block=true`, `use_qk_norm=false`, `attention_bias=false`, `vocab_size=262144`,
   `logit_scale=1.0`, `rms_norm_eps=1e-06` (note: `layer_norm_eps=1e-05` also present but unused for RMSNorm),
   `model_type="cohere2_moe"`, `dtype="bfloat16"`, `max_position_embeddings=500000`.
+
+---
+
+## 9. Performance Engineering Findings (P-1/P-2 Inspection — code-verified)
+
+> Added by Orchestrator after Performance Engineer completed P-1/P-2 source inspection.
+> These findings CORRECT assumptions in the original P-1/P-2 brief (section 4).
+
+### P-1 CORRECTED: MoE default path bypasses all tuned_block_sizes tables
+
+**Original assumption (wrong):** "Tune `fused_moe/v1/tuned_block_sizes.py` + `megablox/tuned_block_sizes.py` for NMC MoE."
+
+**Actual dispatch path:** `layers/jax/moe/utils.py:259 select_moe_backend(use_ep)`:
+- `USE_MOE_EP_KERNEL=1` + `use_ep=True` → `MoEBackend.FUSED_MOE` (uses `fused_moe/v1/tuned_block_sizes.py`)
+- `USE_UNFUSED_MEGABLOCKS=1` → `MoEBackend.MEGABLX_GMM` (uses `megablox/tuned_block_sizes.py`)
+- Otherwise → `MoEBackend.GMM_TP` (default for single-host TP-sharded; **NMC's path**)
+
+All env flags default False. For single-host v7x-4 TP-sharded (`use_ep=False`), the default is **GMM_TP** → `fused_moe_func` → `gmm_wrapper` → `gmm_v2` (`kernels/megablox/gmm_v2.py`).
+
+**The three tuned_block_sizes.py files are ALL OFF the default path:**
+1. `fused_moe/v1/tuned_block_sizes.py` — only FUSED_MOE backend (needs `USE_MOE_EP_KERNEL=1` + EP)
+2. `megablox/tuned_block_sizes.py` (gmm.py) — only MEGABLX_GMM backend (needs `USE_UNFUSED_MEGABLOCKS=1`); AND `gmm_fn` passes explicit tiling bypassing the table anyway
+3. `gmm_v2` (actual NMC path) has **NO tuned table** — only `calculate_tiling` (L884-994), a pure VMEM-fitting heuristic
+
+**`gmm_wrapper` (`fused_moe_gmm.py:123`) hardcodes `tile_info=default`.**
+
+**Conclusion:** Editing any `tuned_block_sizes.py` has ZERO effect on NMC's default MoE path. Real tuning lever = wire custom `tile_info` through `gmm_wrapper`→`gmm_v2`, OR switch backend to FUSED_MOE. Both are call-site changes.
+
+**Decision (Orchestrator):** Option (a) — accept GMM_TP heuristic for baseline. Revisit tile_info wiring (option b) post-baseline if profiling proves MoE is a bottleneck.
+
+### P-2 CORRECTED: RPA v3 clamps KV to sliding_window internally — NO over-fetch
+
+**Original assumption (wrong):** "Default ignores sliding_window → 2x HBM over-fetch in decode."
+
+**Actual behavior:** Regular RPA v3 (`kernels/ragged_paged_attention/v3/kernel.py`) CLAMPS KV to `sliding_window` internally:
+- Decode (L388-391): `cur_seq_start_bkv_idx = jnp.maximum(kv_q_gap - sliding_window, 0) // bkv_sz`
+- Prefill (L939-948): `start_bkv_idx` + `effective_kv_len` clamp to `sliding_window`
+- bkv loop is dynamic `pl.loop(unroll=False)` (L956) — no code bloat, per-iter DMA clamped to sw tokens
+
+**Defaults are FUNCTIONALLY CORRECT — no over-fetch.**
+
+**The regular `tuned_block_sizes.py` (4463 lines) is DEAD CODE** — `get_tuned_block_sizes` is never called in `kernel.py` (only `kernel_hd64.py` self-tunes). Verified: grep for `get_tuned_block_sizes` in `kernel.py` returns nothing.
+
+**Real tuning lever = pass explicit `block_sizes` from the NMC custom attention module** (Kernel Engineer owns it):
+- Default decode `bkv_csz=min(8192, max_kv)=8192` tokens → ~8MB/buffer × 2 double-buffer = borderline v7x VMEM
+- Recommended `bkv_csz=2048-4096` relieves VMEM + improves DMA/compute overlap
+- `page_size` likely 16 (`max_model_len=256K > 8192`)
+
+**Decision (Orchestrator):** Kernel Engineer should parameterize `block_sizes` in the custom attention module so we can tune post-baseline without code changes. Performance Engineer provides the `bkv_csz=2048-4096` recommendation.
