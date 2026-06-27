@@ -353,22 +353,59 @@ class TestDenseLayer0Intermediate(unittest.TestCase):
                         return
         self.fail("Cohere2MLP(...) call not found in Cohere2DecoderLayer.__init__")
 
-    def test_dense_detection_uses_first_k_dense_replace(self):
-        """The dense layer 0 is identified via ``first_k_dense_replace``.
+    def test_dense_detection_prefers_mlp_layer_types(self):
+        """REGRESSION (BUG #3 — runtime crash): ``Cohere2MoeConfig``
+        (transformers >= 5.x) pops ``first_k_dense_replace`` in
+        ``__post_init__`` without storing it, so ``hasattr`` returns False.
+        The canonical signal is ``mlp_layer_types`` — a list of
+        'dense'/'sparse' strings that Cohere2MoeConfig.__post_init__ DOES
+        store. The code must check ``mlp_layer_types`` FIRST (before
+        ``first_k_dense_replace``) so the Cohere2MoeConfig path resolves
+        correctly. Without this, layer 0 is built as MoE (intermediate 768)
+        and crashes on the 3072-wide checkpoint weight.
+        """
+        layer_cls = _find_class(self.tree, "Cohere2DecoderLayer")
+        init_method = _find_method(layer_cls, "__init__")
+        src = ast.unparse(init_method)
+        # mlp_layer_types must be checked.
+        self.assertIn("mlp_layer_types", src,
+                      "dense detection must check mlp_layer_types "
+                      "(the stored attribute on Cohere2MoeConfig)")
+        self.assertRegex(
+            src, r'hasattr\(config,\s*["\']mlp_layer_types["\']\)',
+            "must check hasattr(config, 'mlp_layer_types')")
+        # The 'dense' string comparison must exist (quote-style agnostic).
+        self.assertRegex(src, r'["\']dense["\']',
+                         "must compare mlp_layer_types[layer_idx] == 'dense'")
+        # mlp_layer_types branch must appear BEFORE first_k_dense_replace
+        # (canonical ordering: Cohere2MoeConfig path first).
+        self.assertLess(
+            src.index("mlp_layer_types"),
+            src.index("first_k_dense_replace"),
+            "mlp_layer_types must be checked before first_k_dense_replace "
+            "(Cohere2MoeConfig pops first_k_dense_replace but stores "
+            "mlp_layer_types)")
 
-        ``layer_types`` cannot distinguish the dense layer 0 from the other
-        ``full_attention`` MoE layers (layers 4, 8, ... are also
-        ``full_attention``), so ``first_k_dense_replace`` is the only
-        reliable signal. On the actual serving path (generic
-        PretrainedConfig stores all kwargs as attributes) this returns 1.
+    def test_dense_detection_falls_back_to_first_k_dense_replace(self):
+        """On the generic-PretrainedConfig path (NMC HF repo has no Python
+        files → vLLM loads a plain PretrainedConfig that stores every kwarg
+        as an attribute), ``mlp_layer_types`` is absent but
+        ``first_k_dense_replace`` is present. The code must fall back to it.
         """
         layer_cls = _find_class(self.tree, "Cohere2DecoderLayer")
         init_method = _find_method(layer_cls, "__init__")
         src = ast.unparse(init_method)
         self.assertIn("first_k_dense_replace", src,
-                      "dense detection must use first_k_dense_replace")
-        self.assertIn("is_dense = layer_idx < first_k_dense_replace", src,
-                      "is_dense must be computed from first_k_dense_replace")
+                      "dense detection must fall back to first_k_dense_replace "
+                      "on the generic-PretrainedConfig path")
+        self.assertRegex(
+            src, r'hasattr\(config,\s*["\']first_k_dense_replace["\']\)',
+            "must check hasattr(config, 'first_k_dense_replace') "
+            "as the fallback branch")
+        # is_dense must be assigned from the detection logic.
+        self.assertIn("self.is_dense = is_dense", src,
+                      "self.is_dense must be assigned from the resolved "
+                      "is_dense variable")
 
 
 class TestTiedEmbeddingsDefault(unittest.TestCase):
