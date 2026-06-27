@@ -11,6 +11,39 @@ Implement a JAX-native (`flax_nnx`) model for **CohereLabs/North-Mini-Code-1.0**
 **No brand-new Pallas kernels are required from scratch** — the needed kernels already exist. Your job
 is **model integration + weight remapping + wiring verification + unit tests** (items K-1…K-6 below).
 
+## ⚠️ VERIFICATION CORRECTIONS (code-confirmed by Orchestrator — READ FIRST, supersedes anything below)
+The backlog/brief were spot-checked against the actual repo on `feature/north-mini-code`. Key corrections:
+1. **K-1 sliding-window decode (root cause + solution):** The base `Attention.attention()` decode path
+   (`layers/jax/attention/attention.py` ~L243-250) calls `ragged_paged_attention` **WITHOUT**
+   `sliding_window` → setting `attention_metadata.sliding_window` alone is **silently dropped in decode**.
+   Prefill is fine (`layers/common/attention_interface.py:405` forwards `sliding_window=attention_chunk_size`).
+   **Solution template:** `layers/jax/attention/gpt_oss_attention.py` (NOT `models/jax/`) — a custom
+   attention module whose `attention()` calls the RPA kernel with `sliding_window=md.sliding_window` (L195).
+   gpt_oss uses `ragged_paged_attention_hd64` (its head_dim==64). **NMC head_dim==128 → `use_hd64=False`
+   (attention_interface.py:383) → use the regular `ragged_paged_attention` (v3), NOT hd64.** Build a custom
+   attention module for NMC on this pattern; set `attention_metadata.sliding_window=4096|None` per layer
+   (gpt_oss.py:537-538) + `attention_chunk_size=sliding_window` for prefill (gemma4.py:525).
+2. **MoE API names:** `layers/common/fused_moe_gmm.py::fused_moe_func` uses `scoring_fn`+`activation`
+   (NOT `router_act`); `renormalize: bool` is **required, no default**. `router_act="sigmoid"` is on the
+   `Router` class (llama4.py:524). deepseek_v3 uses `scoring_func` (default `"sigmoid"`) + `norm_topk_prob`
+   (set `False` for NMC → skip the renorm branch at deepseek_v3.py:1110-1119).
+3. **Model interface (K-3):** constructor MUST be `__init__(self, vllm_config, rng_key, mesh)` (3 args) —
+   `_get_nnx_model` (model_loader.py:144) calls `model_class(vllm_config, rng, mesh)`. The validator only
+   checks for a `vllm_config` kwarg, so `__init__(self, vllm_config)` alone would pass validation but
+   **crash at construction**. `__call__(self, kv_caches, input_ids, attention_metadata, ...)`.
+4. **Weight stacking (K-4):** do NOT copy deepseek_v3's `load_weights` (delegates to `JaxAutoWeightsLoader`).
+   Template: `models/jax/gemma4.py:216-249` + `models/jax/gpt_oss.py:283-294,358-374` (EFD/EDF layouts,
+   `permute_dims=(0,2,1)`). NMC stores 128 **separate** per-expert matrices → stack to
+   `(128, 2*768, 2048)` / `(128, 2048, 768)`.
+5. **RoPE:** `apply_rope` defaults `rope_input_ordering="split"`; explicitly pass `"interleaved"` (NeoX
+   adjacent-pair). Conditional per-layer via `use_attention_rope` (attention.py:110, llama4.py:518).
+6. **No single reference combines** `attention_chunk_size=sliding_window` + `rope_input_ordering="interleaved"`
+   + conditional `use_attention_rope`. llama4 has interleaved+conditional-RoPE but uses a fixed
+   `attention_chunk_size=None/8192`; gemma4 has `attention_chunk_size=sliding_window` but split-RoPE.
+   Combine deliberately for NMC.
+7. **`layer_types` strings** in config.json are `"full_attention"` / `"sliding_attention"` (not
+   `"full"`/`"sliding"`). Full §8 verification section is in `porting_backlog.md`.
+
 ## Tools available
 - `/workspace/accelerator-agents/MaxCode/` — PyTorch→JAX/MaxText conversion guidance.
 - `/workspace/accelerator-agents/MaxKernel/` — Pallas kernel writing/profiling/test-harness help.

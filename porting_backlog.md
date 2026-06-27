@@ -271,3 +271,88 @@ profiling traces, and tuned block sizes.
    presence/absence per layer type; MoE expert selection parity.
 4. **Latency profiling:** prefill + decode throughput; per-kernel timings; tune block sizes (P-1/P-2).
 5. **Regression:** ensure no existing registered model breaks.
+
+---
+
+## 8. Verification Findings (code-confirmed by Orchestrator against `feature/north-mini-code`)
+
+> The backlog above was spot-checked against the actual repo. Findings below **supersede** any
+> conflicting phrasing in §2–§6. The Kernel Engineer MUST read these before starting.
+
+### V1. Sliding-window wiring (K-1) — root cause + solution template CONFIRMED
+- **Root cause:** the base `Attention.attention()` decode path (`layers/jax/attention/attention.py`,
+  `_ragged_paged_attention` ~L243-250) calls `ragged_paged_attention(...)` **WITHOUT** `sliding_window`.
+  Setting `attention_metadata.sliding_window` alone on the base class is **silently dropped in decode**.
+- **Prefill path is fine:** `layers/common/attention_interface.py` ~L405 forwards
+  `sliding_window=attention_chunk_size`, so `attention_chunk_size=sliding_window` (gemma4 pattern) works
+  for prefill.
+- **Decode solution template:** `layers/jax/attention/gpt_oss_attention.py` (NOT `models/jax/`) defines a
+  custom attention module whose `attention()` calls the RPA kernel with
+  `sliding_window=md.sliding_window` (L195). gpt_oss uses `ragged_paged_attention_hd64` because its
+  head_dim==64. **NMC head_dim==128 → `use_hd64=False` (attention_interface.py:383 `q.shape[-1]==64`),
+  so NMC must call the regular `ragged_paged_attention` (v3), NOT the hd64 variant.**
+- **Recommended NMC approach:** create a custom attention module (subclass/mirror of base `Attention`,
+  modeled on `gpt_oss_attention.py`) whose decode `attention()` calls
+  `ragged_paged_attention(..., sliding_window=md.sliding_window, ...)`. Per layer set
+  `attention_metadata.sliding_window = 4096` (sliding layers) or `None` (full layers) — gpt_oss pattern
+  (`models/jax/gpt_oss.py:537-538`) — AND set `attention_chunk_size=sliding_window` for the prefill path
+  (gemma4 pattern, `models/jax/gemma4.py:525`).
+
+### V2. MoE API names — corrected
+- `layers/common/fused_moe_gmm.py::fused_moe_func` uses parameters `scoring_fn` and `activation`
+  (**not** `router_act`); `renormalize: bool` is a **required arg with NO default**.
+- `router_act="sigmoid"` lives on the **`Router` class** (`models/jax/llama4.py:524`), not in
+  `fused_moe_gmm.py`.
+- `models/jax/deepseek_v3.py` uses `scoring_func` (default `"sigmoid"`, L1007/1158) + `norm_topk_prob`
+  (L864, L1110-1119: `weights_TX /= sum + 1e-20`). For NMC (`norm_topk_prob=false`) this renorm branch
+  is skipped → raw sigmoid weights. Map NMC onto this path with `norm_topk_prob=False`.
+- `kernels/fused_moe/v1/kernel.py::apply_scoring_fn` has the `sigmoid` case; `renormalize_topk_logits`
+  defaults `False` (L95, L1251).
+
+### V3. Model interface contract — corrected (critical for K-3)
+- `_validate_model_interface` (`models/common/model_loader.py:691-739`) only *requires* that `__init__`
+  accept `vllm_config` and `__call__` accept `kv_caches`, `input_ids`, `attention_metadata` (as kwargs).
+- **But the real instantiation** (`_get_nnx_model`, model_loader.py:144) calls
+  `model_class(vllm_config, rng, mesh)` — **three positional args**. So the constructor MUST be
+  `__init__(self, vllm_config, rng_key, mesh)` (see `DeepseekV3ForCausalLM.__init__` deepseek_v3.py:1376).
+  A model with only `__init__(self, vllm_config)` passes validation but **fails at construction**.
+- `__call__` signature (see deepseek_v3.py:1407): `__call__(self, kv_caches, input_ids,
+  attention_metadata, inputs_embeds=None, ...)`.
+
+### V4. Weight-stacking template — corrected (critical for K-4)
+- `DeepseekV3ForCausalLM.load_weights` (deepseek_v3.py:1441) does **NOT** do per-expert stacking — it
+  delegates to `JaxAutoWeightsLoader`. Do **not** use it as the stacking template.
+- **Use this template instead:** `models/jax/gemma4.py:216-249` (`load_nnx_param_from_reshaped_torch`,
+  `gate_up_proj` split into `kernel_gating_EDF`/`kernel_up_proj_EDF`, `down_proj`→`kernel_down_proj_EFD`
+  with `permute_dims=(0,2,1)`) and `models/jax/gpt_oss.py:283-294` (mappings) + `358-374` (even=gate /
+  odd=up interleaved split → `mlp2_weight_EFD`). Confirm the exact EFD vs EDF layout the megablox/fused_moe
+  kernel consumes before finalizing.
+- NMC safetensors store **128 separate per-expert** `gate/up=(768,2048)`, `down=(2048,768)` matrices →
+  stack into `(128, 2*768, 2048)` and `(128, 2048, 768)`.
+
+### V5. RoPE — default + interleaved style
+- `layers/jax/rope_interface.py::apply_rope` defaults `rope_input_ordering="split"` (L50). NMC needs
+  NeoX **adjacent-pair** rotation → **explicitly pass `rope_input_ordering="interleaved"`** (handled
+  L208-228). The backlog's phrase "NeoX-style adjacent-pair" = the `"interleaved"` branch.
+- Conditional per-layer RoPE via `use_attention_rope` confirmed on `Attention.__call__` (attention.py:110)
+  and used by llama4 (`models/jax/llama4.py:518,635`).
+
+### V6. Attention attributes are split across files (no single reference)
+- No existing model combines all three of: `attention_chunk_size=sliding_window` (gemma4.py:525),
+  `rope_input_ordering="interleaved"` (llama4.py:574), conditional `use_attention_rope` (llama4.py:518).
+  llama4 uses `attention_chunk_size=None if use_attention_rope else 8192` (a fixed chunk, NOT
+  sliding_window). **NMC must combine these deliberately.**
+
+### V7. `layer_types` string values
+- HF `config.json` uses `"full_attention"` / `"sliding_attention"` (not `"full"`/`"sliding"`). 49 entries:
+  `[full_attention, sliding_attention×3]` repeated ×12 + final `full_attention`. Layer 0 is dense
+  (`first_k_dense_replace=1`, `prefix_dense_intermediate_size=3072`); layers 1–48 MoE.
+
+### V8. Architecture numbers re-confirmed from HF config.json
+- `num_hidden_layers=49`, `num_experts=128`, `num_experts_per_tok=8`, `num_shared_experts=0`,
+  `intermediate_size=768`, `prefix_dense_intermediate_size=3072`, `hidden_size=2048`, `head_dim=128`,
+  `num_attention_heads=32`, `num_key_value_heads=4`, `sliding_window=4096`, `rope_theta=50000`,
+  `rope_scaling=null`, `expert_selection_fn="sigmoid"`, `norm_topk_prob=false`, `use_gated_activation=true`,
+  `use_parallel_block=true`, `use_qk_norm=false`, `attention_bias=false`, `vocab_size=262144`,
+  `logit_scale=1.0`, `rms_norm_eps=1e-06` (note: `layer_norm_eps=1e-05` also present but unused for RMSNorm),
+  `model_type="cohere2_moe"`, `dtype="bfloat16"`, `max_position_embeddings=500000`.
