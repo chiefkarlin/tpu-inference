@@ -88,7 +88,7 @@ At ctx=256K: full layers read 256K×2KB=512MB each → 13×512=6,656MB + 36×8=2
 
 | Component             | Per-chip (TP=4) | Notes |
 |-----------------------|-----------------|-------|
-| MoE weights           | ~910 MB         | 3,624 MB / 4 (GMM_TP shards hidden dim) |
+| MoE weights           | ~906 MB         | 3,624 MB / 4 (GMM_TP shards F/intermediate dim: GMM1 col-parallel on 2F, GMM2 row-parallel on F) |
 | Attention weights     | ~334 MB         | 1,338 MB / 4 |
 | Dense MLP             | ~9 MB           | 37 MB / 4 |
 | LM head               | ~1,074 MB       | Replicated (vocab dim not sharded with TP=4) or sharded |
@@ -313,9 +313,14 @@ heuristic). No tuned table. gmm_wrapper hardcodes tile_info=default.
 
 **If MoE is a proven bottleneck after baseline profiling:**
 
-1. Capture the calculate_tiling output for NMC shapes:
-   - GMM1: size_m=tokens, size_k=2048/TP, size_n=1536/TP (or full, depends on shard)
-   - GMM2: size_m=tokens, size_k=768, size_n=2048/TP
+1. Capture the calculate_tiling output for NMC shapes (TP=4, from fused_moe_gmm.py:393-394):
+   - GMM1 (gate+up, w1 shape (E,2F,D)=(128,1536,2048), w1_spec=P(None,None,MLP_TENSOR)):
+     column-parallel → size_k=D=2048 (full), size_n=2F/TP=1536/4=384 (sharded).
+     Per-chip weight: 8 experts × 2048 × 384 × 2B = 12.6 MB/layer.
+   - GMM2 (down, w2 shape (E,F,D)=(128,768,2048), w2_spec=P(None,MLP_TENSOR,None)):
+     row-parallel → size_k=F/TP=768/4=192 (sharded), size_n=D=2048 (full).
+     Per-chip weight: 8 experts × 192 × 2048 × 2B = 6.3 MB/layer.
+   - GMM2 reduction: row-parallel → all-reduce (psum) on MLP_TENSOR axis at end.
    - Record tile_m, tile_k, tile_n from the trace compile logs.
 
 2. Identify whether tile_n is too small (MXU underutilization) or tile_k is
