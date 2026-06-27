@@ -22,27 +22,26 @@
 - Orchestrator reviews + merges agent branches back into `feature/north-mini-code`; resolves conflicts.
 - Agents coordinate through the Orchestrator via `scion message`.
 
-## Phase 1: Model Integration (Kernel Engineer — K-1…K-6) — IN PROGRESS
-- [~] K-1 Verify sliding-window reaches RPA v3 kernel in **decode**; wire if dropped (HIGH, correctness risk)
-      → Root cause CONFIRMED: base Attention drops sliding_window in decode; solution = custom attention module
-        modeled on gpt_oss_attention.py but using regular ragged_paged_attention (head_dim=128, not hd64)
-- [ ] K-2 Verify fused_moe/megablox GMM accepts NMC topology (128 exp, 768 interm, topk=8, sigmoid, no-renorm)
-- [ ] K-3 Implement `models/jax/cohere2_moe.py` → `Cohere2MoeForCausalLM` (parallel block, hybrid schedule, conditional interleaved RoPE, tied head)
-- [ ] K-4 Weight remapper (128 per-expert → fused 3-D; dense layer 0; tied head)
-- [ ] K-5 Register `Cohere2MoeForCausalLM` in `models/common/model_loader.py`
-- [ ] K-6 Unit tests (weight shapes, sigmoid-no-renorm routing, parallel-block forward, RoPE conditional)
-- [ ] Hand off compilable model to Performance Engineer
+## Phase 1: Model Integration (Kernel Engineer — K-1…K-6) — COMPLETE ✅
+- [x] K-1 Sliding-window decode wiring — custom `cohere2_attention.py` (regular RPA v3, head_dim=128, d_block_sizes=(1,4096,1,2048))
+- [x] K-2 MoE topology verified (128 exp, 768 interm, topk=8, sigmoid, no-renorm via JaxMoE delegation)
+- [x] K-3 `models/jax/cohere2_moe.py` → `Cohere2MoeForCausalLM` (parallel block, hybrid schedule, conditional interleaved RoPE, tied head) — commit `1fc5507b` + fixes `be319e71`
+- [x] K-4 Weight remapping via JaxMoE._load_weights (128 per-expert → fused EDF/EFD; dense layer 0 prefix_dense_intermediate_size)
+- [x] K-5 Registered `Cohere2MoeForCausalLM` in `models/common/model_loader.py`
+- [x] K-6 28 AST structural tests — all PASS (independently verified by orchestrator + perf eng)
+- [x] Code review: tri-directional review found 3 bugs → 3 fixes applied → re-reviewed → 28/28 tests PASS
+- [x] Hand off to Performance Engineer — merged into perf branch `65b98ebf`
 
-## Phase 2: v7x Bring-up & Tuning (Performance Engineer — P-1…P-4) — IN PROGRESS
-- [x] P-1 MoE tuning inspection — **CORRECTED**: default path is GMM_TP→gmm_v2 (calculate_tiling heuristic, no tuned table). All tuned_block_sizes.py files are OFF the default path. Decision: accept heuristic for baseline; revisit tile_info wiring post-baseline if profiling proves bottleneck. See backlog §9.
-- [x] P-2 RPA v3 tuning inspection — **CORRECTED**: RPA v3 clamps KV to sliding_window internally (no over-fetch). tuned_block_sizes.py is dead code for regular path. Real lever = explicit block_sizes in custom attention module (kernel eng owns). Recommendation: bkv_csz=2048-4096. See backlog §9.
-- [!] P-3 GKE auth → build+push Docker to GAR → inject HF_TOKEN → kubectl run on v7x-4 / single-host-vllm — **BLOCKED on cluster creds** (metadata concealment; escalated to user). Perf eng proceeding with P-4 prep + Docker scaffolding + kubectl manifests in the meantime.
-- [~] P-4 Capture ML Diagnostics trace + per-kernel timings; identify HBM bottlenecks — profiling plan being drafted (no cluster access needed for plan)
+## Phase 2: v7x Bring-up & Tuning (Performance Engineer — P-1…P-4)
+- [x] P-1 MoE tuning inspection — **CORRECTED**: default path is GMM_TP→gmm_v2 (calculate_tiling heuristic, no tuned table). All tuned_block_sizes.py files are OFF the default path. Decision: accept heuristic for baseline. See backlog §9.
+- [x] P-2 RPA v3 tuning inspection — **CORRECTED**: RPA v3 clamps KV to sliding_window internally. Real lever = explicit d_block_sizes=(1,4096,1,2048) in custom attention module (adopted by kernel eng). See backlog §9.
+- [!] P-3 GKE auth → build+push Docker to GAR → inject HF_TOKEN → kubectl run on v7x-4 / single-host-vllm — **BLOCKED on cluster creds** (SOLE remaining blocker; escalated to user). Docker build script + Cloud Build config + k8s manifest all ready on perf branch.
+- [~] P-4 Capture ML Diagnostics trace + per-kernel timings; identify HBM bottlenecks — profiling plan (307 lines) + trace analysis script ready; needs cluster access.
 
 ## Phase 3: Integration & Validation (Orchestrator)
 - [ ] Review & merge `feature/north-mini-code-kernels` → `feature/north-mini-code`
 - [ ] Review & merge `feature/north-mini-code-perf` → `feature/north-mini-code`
-- [ ] End-to-end NMC inference on v7x-4 with real weights (correctness sanity)
+- [ ] End-to-end NMC inference on v7x-4 with real weights (correctness sanity) — blocked on P-3
 - [ ] No regression on existing registered models
 
 ## Status Legend
