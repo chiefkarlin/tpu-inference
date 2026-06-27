@@ -9,21 +9,19 @@ traces, (3) trace capture strategy, and (4) the optimization feedback loop.
 
 ## 1. Hardware Specs (v7x-4 single host)
 
-| Spec                 | Value (approx)         | Source |
+| Spec                 | Value                  | Source |
 |----------------------|------------------------|--------|
 | Chips                | 4                      | topology 2x2x1 |
 | Cores/chip           | 2                      | tpu7x arch |
 | Total cores          | 8                      | |
-| HBM/chip             | 192 GB                 | utils.py:188 |
-| HBM/core (JAX dev)   | 96 GB                  | utils.py:190 |
-| Total HBM            | 768 GB                 | |
-| HBM BW/chip          | ~3.2 TB/s (est.)       | to verify at runtime via tpu_info |
-| MXU peak BF16/chip   | ~1.5 PFLOP/s (est.)    | to verify at runtime |
+| HBM/chip             | 192 GiB                | utils.py:188 + tpu_specs.json |
+| HBM/core (JAX dev)   | 96 GiB                 | utils.py:190 |
+| Total HBM            | 768 GiB                | |
+| HBM BW/chip          | 7.4 TB/s               | MaxKernel tpu_specs.json (Ironwood) |
+| MXU peak BF16/chip   | 2,157 TFLOP/s          | MaxKernel tpu_specs.json (Ironwood) |
+| MXU peak INT8/chip   | 4,314 TOPS             | MaxKernel tpu_specs.json |
 | VMEM/core            | ~64 MB (est.)          | pltpu.get_tpu_info().vmem_capacity_bytes |
-
-> **Note:** Exact HBM BW and MXU peak will be confirmed at runtime from
-> `pltpu.get_tpu_info()` and the `tpu_info` package. The estimates above are
-> based on public v7x documentation; actual values may differ.
+| Interconnect         | 3D Torus               | tpu_specs.json |
 
 ---
 
@@ -105,11 +103,11 @@ At ctx=256K: full layers read 256K×2KB=512MB each → 13×512=6,656MB + 36×8=2
 
 ```
 HBM read per chip ≈ 2,719 MB = 2.719 GB
-HBM BW per chip ≈ 3.2 TB/s (est.)
-T_min ≈ 2.719 GB / 3.2 TB/s ≈ 0.85 ms/token
+HBM BW per chip = 7.4 TB/s (Ironwood, confirmed from tpu_specs.json)
+T_min ≈ 2.719 GB / 7.4 TB/s ≈ 0.37 ms/token
 ```
 
-Target decode throughput: ~1,000-1,200 tok/s (if HBM-bound at 0.85 ms/tok).
+Target decode throughput: ~2,700 tok/s (if HBM-bound at 0.37 ms/tok).
 **Actual will be higher** due to: DMA/compute non-overlap, MoE dispatch
 overhead, router compute, normalization, sampling, and inter-chip collectives.
 
@@ -120,9 +118,9 @@ Prefill is compute-bound (MXU). For prompt length P tokens:
 - Attention FLOPs/token (approx): 4 × 2048 × 128 × num_kv_heads ≈ 4.2 MFLOP (QK+AV per layer)
 - 48 MoE layers + 49 attn layers: ~3.8 GFLOP/token (weights) + ~0.2 GFLOP (attn)
 - Total: ~4.0 GFLOP/token
-- For P=1024: 4.1 TFLOP, at 1.5 PFLOP/s/chip × 4 chips = 6 PFLOP/s → T_min ≈ 0.68 ms
+- For P=1024: 4.1 TFLOP, at 2,157 TFLOP/s/chip × 4 chips = 8,628 TFLOP/s → T_min ≈ 0.48 ms
 - But prefill is also HBM-bound for weight reads (same weights regardless of P):
-  HBM = 2.719 GB/chip, same as decode → ~0.85 ms floor.
+  HBM = 2.719 GB/chip, same as decode → ~0.37 ms floor.
 
 > For short prompts (P < ~256), prefill is HBM-bound (same as decode).
 > For long prompts (P > ~1024), prefill becomes compute-bound.
@@ -155,7 +153,7 @@ steps 10-20 automatically.
 |---------------------------|-----------------------------------------|--------|
 | Kernel wall time          | Trace event duration                    | Compare to T_min |
 | HBM bytes read            | DMA event sizes (HBM→VMEM transfers)    | Compare to theoretical |
-| Achieved HBM BW           | HBM bytes / kernel time                 | >70% of peak (~2.2 TB/s) |
+| Achieved HBM BW           | HBM bytes / kernel time                 | >70% of peak (~5.2 TB/s) |
 | MXU utilization           | MXU compute events / kernel time        | Decode: <5% (memory-bound); Prefill: >50% |
 | DMA/compute overlap       | Overlap of DMA and MXU events in trace  | >60% overlap |
 | VMEM utilization          | Max VMEM allocated (from Pallas compile)| <90% of capacity |
@@ -220,6 +218,41 @@ steps 10-20 automatically.
 6. **MoE-focused trace:** isolate gmm_v2 kernel. Capture tile sizes from
    calculate_tiling. Measure achieved BW vs theoretical for 8-expert dispatch.
 7. If justified, prototype tile_info override and re-profile.
+
+---
+
+## 6b. Trace Analysis Tooling (MaxKernel)
+
+The `accelerator-agents/MaxKernel` toolkit provides offline xplane.pb analysis:
+
+- **`offline_tools.py::load_xplane_and_query(xplane_path, sql_query)`**: loads an
+  xplane.pb trace into an in-memory SQLite DB and runs SQL queries. Schema:
+  - `planes (id, name)` — TPU planes (hosts/devices)
+  - `lines (id, plane_id, display_id, name, timestamp_ns)` — trace lines/streams
+  - `events (plane_id, line_id, name, offset_ps, duration_ps, start_ps, end_ps)` — kernel/DMA events
+
+  Example queries:
+  ```sql
+  -- Top-10 longest kernel events
+  SELECT name, COUNT(*) as calls, AVG(duration_ps)/1e6 as avg_ms
+  FROM events GROUP BY name ORDER BY AVG(duration_ps) DESC LIMIT 10;
+
+  -- Total time in RPA attention kernels
+  SELECT SUM(duration_ps)/1e6 as total_ms FROM events
+  WHERE name LIKE '%ragged_paged_attention%';
+
+  -- MoE GMM kernel timings
+  SELECT name, COUNT(*), SUM(duration_ps)/1e6 as total_ms
+  FROM events WHERE name LIKE '%gmm%' GROUP BY name;
+  ```
+
+- **MaxKernel HITL agent** (`run_hitl_agent.sh`): interactive agent with
+  ProfileAgentOrchestrator for DMA/memory transfer analysis, compute vs memory
+  ratio, and bottleneck identification with recommendations.
+
+- **JAXBench** (`python -m JAXBench evaluate`): empirical kernel benchmarking
+  against baselines. Returns median_ms, tflops, utilization_pct, speedup_vs_baseline.
+  Can be used to benchmark individual NMC kernels (MoE GMM, RPA) in isolation.
 
 ---
 
