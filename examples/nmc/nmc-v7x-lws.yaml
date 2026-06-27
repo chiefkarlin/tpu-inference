@@ -1,0 +1,177 @@
+# LeaderWorkerSet manifest for NMC inference on v7x 2x2x2 multi-host TPU slice.
+#
+# WHY LWS: 2x2x2 topology is a MULTI-HOST slice (2 hosts × 4 chips) requiring
+# Ray leader/worker coordination. A single Pod cannot use 2x2x2 — TPU init
+# fails with "Expected 2 worker addresses, got 1". LWS creates a leader+worker
+# pair that forms a Ray cluster, matching the proven gpt-oss/qwen pattern.
+#
+# TP=8: Uses all 8 chips (16 cores) across 2 hosts. NMC has 4 KV heads →
+# 4/8=0.5 → KV head replication (factor 2). Same ratio as gpt-oss (8 KV heads,
+# TP=16). vLLM TPU path supports this.
+#
+# Usage:
+#   1. Scale down existing workloads to free 2x2x2 nodes:
+#      kubectl scale lws vllm-qwen -n default --replicas=0
+#   2. Delete any pending NMC pod:
+#      kubectl delete pod nmc-v7x-inference -n default --force --grace-period=0
+#   3. Apply this manifest:
+#      kubectl apply -f nmc-v7x-lws.yaml
+#   4. Monitor:
+#      kubectl get pods -n default -l leaderworkerset_set=nmc-v7x-inference
+#   5. Test once leader is Ready:
+#      curl http://<leader-pod-ip>:8000/v1/completions -X POST \
+#        -H "Content-Type: application/json" \
+#        -d '{"model":"CohereLabs/North-Mini-Code-1.0","prompt":"def hello():","max_tokens":32,"temperature":0}'
+#   6. Restore qwen after e2e:
+#      kubectl scale lws vllm-qwen -n default --replicas=1
+
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: nmc-v7x-inference
+  namespace: default
+  annotations:
+    leaderworkerset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 2  # leader + worker = 2 hosts
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      metadata:
+        labels:
+          role: leader
+          app: nmc-v7x-inference
+      spec:
+        nodeSelector:
+          cloud.google.com/gke-tpu-accelerator: tpu7x
+          cloud.google.com/gke-tpu-topology: 2x2x2
+        tolerations:
+          - effect: NoSchedule
+            key: google.com/tpu
+            operator: Exists
+        containers:
+          - name: nmc-leader
+            image: gcr.io/northam-ce-mlai-tpu/nmc-inference:latest
+            imagePullPolicy: Always
+            command:
+              - sh
+              - -c
+              - |
+                bash /workspace/vllm/examples/online_serving/multi-node-serving.sh leader --ray_cluster_size=$(LWS_GROUP_SIZE);
+                python3 -m vllm.entrypoints.openai.api_server \
+                  --host 0.0.0.0 --port 8000 --seed 42 \
+                  --tensor-parallel-size 8 --data-parallel-size 1 \
+                  --max-model-len 8192 --max-num-seqs 8 \
+                  --max-num-batched-tokens 1024 \
+                  --no-enable-prefix-caching \
+                  --model CohereLabs/North-Mini-Code-1.0 \
+                  --dtype bfloat16 --trust-remote-code \
+                  --gpu-memory-utilization 0.9 \
+                  --enable-expert-parallel \
+                  --disable-log-requests
+            env:
+              - name: HUGGING_FACE_HUB_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: hf-token-secret
+                    key: token
+              - name: TPU_MULTIHOST_BACKEND
+                value: "ray"
+              - name: TPU_BACKEND_TYPE
+                value: "jax"
+              - name: JAX_PLATFORMS
+                value: ""
+              - name: SKIP_JAX_PRECOMPILE
+                value: "1"
+              - name: VLLM_XLA_CHECK_RECOMPILATION
+                value: "0"
+              - name: VLLM_XLA_CACHE_PATH
+                value: /tmp/jax_cache
+            ports:
+              - containerPort: 8000
+                protocol: TCP
+            resources:
+              limits:
+                google.com/tpu: "4"
+            volumeMounts:
+              - mountPath: /dev/shm
+                name: dshm
+              - mountPath: /root/.cache/huggingface
+                name: hf-cache
+              - mountPath: /tmp/jax_cache
+                name: jax-cache
+        volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 8Gi
+          - name: hf-cache
+            emptyDir:
+              sizeLimit: 100Gi
+          - name: jax-cache
+            emptyDir:
+              sizeLimit: 20Gi
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 300
+          periodSeconds: 10
+          failureThreshold: 60
+    workerTemplate:
+      spec:
+        nodeSelector:
+          cloud.google.com/gke-tpu-accelerator: tpu7x
+          cloud.google.com/gke-tpu-topology: 2x2x2
+        tolerations:
+          - effect: NoSchedule
+            key: google.com/tpu
+            operator: Exists
+        containers:
+          - name: nmc-worker
+            image: gcr.io/northam-ce-mlai-tpu/nmc-inference:latest
+            imagePullPolicy: Always
+            command:
+              - sh
+              - -c
+              - |
+                until bash /workspace/vllm/examples/online_serving/multi-node-serving.sh worker --ray_address=$(LWS_LEADER_ADDRESS); do
+                  echo 'Waiting for leader Ray head...';
+                  sleep 10;
+                done
+            env:
+              - name: HUGGING_FACE_HUB_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: hf-token-secret
+                    key: token
+              - name: TPU_MULTIHOST_BACKEND
+                value: "ray"
+              - name: TPU_BACKEND_TYPE
+                value: "jax"
+              - name: JAX_PLATFORMS
+                value: ""
+              - name: VLLM_XLA_CACHE_PATH
+                value: /tmp/jax_cache
+            resources:
+              limits:
+                google.com/tpu: "4"
+            volumeMounts:
+              - mountPath: /dev/shm
+                name: dshm
+              - mountPath: /root/.cache/huggingface
+                name: hf-cache
+              - mountPath: /tmp/jax_cache
+                name: jax-cache
+        volumes:
+          - name: dshm
+            emptyDir:
+              medium: Memory
+              sizeLimit: 8Gi
+          - name: hf-cache
+            emptyDir:
+              sizeLimit: 100Gi
+          - name: jax-cache
+            emptyDir:
+              sizeLimit: 20Gi
