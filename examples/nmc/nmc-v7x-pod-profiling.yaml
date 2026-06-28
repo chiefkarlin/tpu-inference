@@ -1,0 +1,111 @@
+# Kubernetes pod manifest for NMC inference on v7x-4 with PROFILING ENABLED.
+#
+# This is the same as nmc-v7x-pod.yaml but with --profiler torch added to
+# VLLM_ARGS, enabling the /start_profile and /stop_profile HTTP endpoints.
+# Use this for P-4 trace capture AFTER the initial e2e sanity check passes
+# with the standard nmc-v7x-pod.yaml.
+#
+# Usage:
+#   1. Delete the standard pod:      kubectl delete pod nmc-v7x-inference
+#   2. Deploy the profiling pod:      kubectl apply -f nmc-v7x-pod-profiling.yaml
+#   3. Wait for Ready (weights re-download ~3.5min + compile)
+#   4. Capture trace:                 ./capture_nmc_trace.sh --analyze
+#
+# The profiling overhead is minimal — jax.profiler.start_trace() only records
+# when /start_profile is called, and stops at /stop_profile. Normal serving
+# between profile sessions has zero overhead.
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nmc-v7x-inference
+  labels:
+    app: nmc-v7x-inference
+spec:
+  nodeSelector:
+    cloud.google.com/gke-tpu-accelerator: tpu7x
+    cloud.google.com/gke-tpu-topology: 2x2x1
+
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: cloud.google.com/gke-nodepool
+                operator: In
+                values:
+                  - single-host-vllm
+
+  restartPolicy: Never
+
+  containers:
+    - name: nmc-server
+      image: gcr.io/northam-ce-mlai-tpu/nmc-inference:latest
+      imagePullPolicy: Always
+      env:
+        - name: HUGGING_FACE_HUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token-secret
+              key: token
+        # --- vLLM serving args WITH PROFILING ENABLED ---
+        - name: VLLM_ARGS
+          value: >-
+            --model CohereLabs/North-Mini-Code-1.0
+            --port 8000
+            --tensor-parallel-size 4
+            --dtype bfloat16
+            --trust-remote-code
+            --max-model-len 8192
+            --max-num-seqs 8
+            --max-num-batched-tokens 1024
+            --no-enable-prefix-caching
+            --gpu-memory-utilization 0.9
+            --seed 42
+            --profiler torch
+            --torch-profiler-dir /tmp/profiles
+        - name: SKIP_JAX_PRECOMPILE
+          value: "1"
+        - name: VLLM_XLA_CHECK_RECOMPILATION
+          value: "0"
+        - name: VLLM_XLA_CACHE_PATH
+          value: /tmp/jax_cache
+      ports:
+        - containerPort: 8000
+      resources:
+        requests:
+          google.com/tpu: 4
+        limits:
+          google.com/tpu: 4
+      volumeMounts:
+        - name: hf-cache
+          mountPath: /root/.cache/huggingface
+        - name: jax-cache
+          mountPath: /tmp/jax_cache
+        - name: profiles
+          mountPath: /tmp/profiles
+        - name: dshm
+          mountPath: /dev/shm
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 8000
+        initialDelaySeconds: 300
+        periodSeconds: 10
+        failureThreshold: 60
+
+  volumes:
+    - name: hf-cache
+      emptyDir:
+        sizeLimit: 100Gi
+    - name: jax-cache
+      emptyDir:
+        sizeLimit: 20Gi
+    - name: profiles
+      emptyDir:
+        sizeLimit: 20Gi
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 8Gi
