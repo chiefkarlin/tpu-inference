@@ -31,21 +31,20 @@ metadata:
   labels:
     app: nmc-v7x-inference
 spec:
-  # Schedule on the single-host-vllm node pool with v7x-4 topology (2x2x1).
+  # Schedule on any v7x TPU node with 2x2x1 topology (4 chips = v7x-4).
+  # Accepts both on-demand (single-host-vllm pool) and spot (v7x-2x2x1-spot pool).
   # 2x2x2 (multi-host) requires LWS+Ray and cannot be used with a single Pod.
   nodeSelector:
     cloud.google.com/gke-tpu-accelerator: tpu7x
     cloud.google.com/gke-tpu-topology: 2x2x1  # 4 chips = v7x-4
 
-  affinity:
-    nodeAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        nodeSelectorTerms:
-          - matchExpressions:
-              - key: cloud.google.com/gke-nodepool
-                operator: In
-                values:
-                  - single-host-vllm
+  tolerations:
+    - key: google.com/tpu
+      value: present
+      effect: NoSchedule
+    - key: cloud.google.com/gke-spot
+      value: "true"
+      effect: NoSchedule
 
   restartPolicy: Never
 
@@ -135,13 +134,19 @@ spec:
           mountPath: /tmp/jax_cache
         - name: dshm
           mountPath: /dev/shm
+      startupProbe:
+        httpGet:
+          path: /health
+          port: 8000
+        initialDelaySeconds: 60
+        periodSeconds: 15
+        failureThreshold: 80  # 60s + 80*15s = 20min for weight download + compile
       readinessProbe:
         httpGet:
           path: /health
           port: 8000
-        initialDelaySeconds: 300  # weight download (61GB) + compile takes time
         periodSeconds: 10
-        failureThreshold: 60  # allow up to 10 min startup
+        failureThreshold: 6  # 60s grace once started
 
   volumes:
     - name: hf-cache

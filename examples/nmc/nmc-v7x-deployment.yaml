@@ -1,0 +1,107 @@
+# NMC inference Deployment for spot TPU nodes (2x2x1, tpu7x, TP=4).
+# Uses emptyDir for weights (no PVC — the pre-existing model-weights-pv's
+# underlying GCE PD disk was deleted). Weight download (~3.5min) runs on every
+# pod start. Proven viable: prior runs completed download before spot preemption.
+#
+# Usage:
+#   kubectl apply -f nmc-v7x-deployment.yaml
+#   kubectl rollout status deployment/nmc-v7x-inference
+#   # Once Running + Ready, test via kubectl exec:
+#   kubectl exec deployment/nmc-v7x-inference -- curl -s localhost:8000/v1/completions \
+#     -X POST -H "Content-Type: application/json" \
+#     -d '{"model":"CohereLabs/North-Mini-Code-1.0","prompt":"def hello():","max_tokens":32,"temperature":0}'
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nmc-v7x-inference
+  labels:
+    app: nmc-v7x-inference
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  progressDeadlineSeconds: 1800  # 30min: allow weight download + compile
+  selector:
+    matchLabels:
+      app: nmc-v7x-inference
+  template:
+    metadata:
+      labels:
+        app: nmc-v7x-inference
+    spec:
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+
+      tolerations:
+        - key: google.com/tpu
+          value: present
+          effect: NoSchedule
+        - key: cloud.google.com/gke-spot
+          value: "true"
+          effect: NoSchedule
+
+      terminationGracePeriodSeconds: 30  # fast cleanup on spot preemption
+
+      containers:
+        - name: nmc-server
+          image: gcr.io/northam-ce-mlai-tpu/nmc-inference:latest
+          imagePullPolicy: Always
+          env:
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: token
+            - name: VLLM_ARGS
+              value: >-
+                --model CohereLabs/North-Mini-Code-1.0
+                --port 8000
+                --tensor-parallel-size 4
+                --dtype bfloat16
+                --trust-remote-code
+                --max-model-len 8192
+                --max-num-seqs 8
+                --max-num-batched-tokens 1024
+                --no-enable-prefix-caching
+                --gpu-memory-utilization 0.9
+                --seed 42
+            - name: SKIP_JAX_PRECOMPILE
+              value: "1"
+            - name: VLLM_XLA_CHECK_RECOMPILATION
+              value: "0"
+          ports:
+            - containerPort: 8000
+          resources:
+            requests:
+              google.com/tpu: 4
+            limits:
+              google.com/tpu: 4
+          volumeMounts:
+            - name: hf-cache
+              mountPath: /root/.cache/huggingface
+            - name: dshm
+              mountPath: /dev/shm
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            failureThreshold: 80  # 60s + 80*15s = 20min for download + compile
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 10
+            failureThreshold: 6
+
+      volumes:
+        - name: hf-cache
+          emptyDir: {}
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
