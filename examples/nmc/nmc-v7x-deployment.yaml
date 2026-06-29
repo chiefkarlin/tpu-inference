@@ -1,6 +1,6 @@
-# NMC inference Deployment for spot TPU nodes (2x2x1, tpu7x, TP=4).
-# Uses emptyDir for weights (no PVC — the pre-existing model-weights-pv's
-# underlying GCE PD disk was deleted). Weight download (~3.5min) runs on every
+# NMC inference Deployment for DWS Flex TPU nodes (2x2x1, tpu7x, TP=4).
+# Targets single-host-vllm flex node pool with DWS Flex tolerations.
+# Uses emptyDir for weights (no PVC). Weight download (~3.5min) runs on every
 # pod start. Proven viable: prior runs completed download before spot preemption.
 #
 # Usage:
@@ -34,12 +34,14 @@ spec:
       nodeSelector:
         cloud.google.com/gke-tpu-accelerator: tpu7x
         cloud.google.com/gke-tpu-topology: 2x2x1
+        cloud.google.com/gke-nodepool: single-host-vllm
 
       tolerations:
         - key: google.com/tpu
-          value: present
+          operator: Exists
           effect: NoSchedule
-        - key: cloud.google.com/gke-spot
+        - key: cloud.google.com/gke-queued
+          operator: Equal
           value: "true"
           effect: NoSchedule
 
