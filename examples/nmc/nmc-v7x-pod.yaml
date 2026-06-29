@@ -31,21 +31,20 @@ metadata:
   labels:
     app: nmc-v7x-inference
 spec:
-  # Schedule on the single-host-vllm node pool with v7x-4 topology (2x2x1).
+  # Schedule on any v7x TPU node with 2x2x1 topology (4 chips = v7x-4).
+  # Accepts both on-demand (single-host-vllm pool) and spot (v7x-2x2x1-spot pool).
   # 2x2x2 (multi-host) requires LWS+Ray and cannot be used with a single Pod.
   nodeSelector:
     cloud.google.com/gke-tpu-accelerator: tpu7x
     cloud.google.com/gke-tpu-topology: 2x2x1  # 4 chips = v7x-4
 
-  affinity:
-    nodeAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        nodeSelectorTerms:
-          - matchExpressions:
-              - key: cloud.google.com/gke-nodepool
-                operator: In
-                values:
-                  - single-host-vllm
+  tolerations:
+    - key: google.com/tpu
+      value: present
+      effect: NoSchedule
+    - key: cloud.google.com/gke-spot
+      value: "true"
+      effect: NoSchedule
 
   restartPolicy: Never
 
