@@ -107,15 +107,20 @@ class Cohere2Attention(JaxModule):
     mesh: Mesh
     kv_cache_dtype: str
 
-    # Sharding
-    dnh_sharding: Sharding = ()
-    dkh_sharding: Sharding = ()
-    nhd_sharding: Sharding = ()
+    # Sharding — Q/KV head dims sharded on the "model" (TP) axis so that
+    # GQA weights and activations are partitioned correctly under TP>1.
+    # Without this, K/V tensors retain the full num_key_value_heads (e.g. 4)
+    # while the kv_cache is TP-sharded to 1 head/device, causing a shape
+    # mismatch in the RPA v3 kernel's static_validate_inputs.
+    # Pattern follows llama4.py (Llama4Attention construction).
+    dnh_sharding: Sharding = (None, ShardingAxisName.MODEL, None)
+    dkh_sharding: Sharding = (None, ShardingAxisName.MODEL, None)
+    nhd_sharding: Sharding = (ShardingAxisName.MODEL, None, None)
 
     activation_q_td: P = P(ShardingAxisName.ATTN_DATA)
-    query_tnh: P = P(ShardingAxisName.ATTN_DATA)
-    keyvalue_skh: P = P(ShardingAxisName.ATTN_DATA)
-    attn_o_tnh: P = P(ShardingAxisName.ATTN_DATA)
+    query_tnh: P = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.MODEL, None)
+    keyvalue_skh: P = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.MODEL, None)
+    attn_o_tnh: P = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.MODEL, None)
 
     rngs: InitVar[nnx.Rngs]
 
