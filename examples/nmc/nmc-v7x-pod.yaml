@@ -22,6 +22,10 @@
 # LWS (LeaderWorkerSet) + Ray coordination. A single Pod CANNOT use 2x2x2 —
 # TPU init fails with "Expected 2 worker addresses, got 1". Must use 2x2x1
 # (single-host-vllm pool) for single-Pod deployment.
+#
+# DWS Flex: single-host-vllm pool uses Dynamic Workload Scheduler (Flex Start).
+# GKE auto-taints Flex nodes with google.com/tpu + cloud.google.com/gke-queued.
+# Pods MUST tolerate both taints or the autoscaler won't request capacity.
 
 ---
 apiVersion: v1
@@ -31,37 +35,22 @@ metadata:
   labels:
     app: nmc-v7x-inference
 spec:
-  # Schedule on any v7x TPU node with 2x2x1 topology (4 chips = v7x-4).
-  # Accepts both on-demand (single-host-vllm pool) and spot (v7x-2x2x1-spot pool).
-  # 2x2x2 (multi-host) requires LWS+Ray and cannot be used with a single Pod.
+  # Schedule on single-host-vllm pool (2x2x1 = 4 chips = v7x-4).
   nodeSelector:
     cloud.google.com/gke-tpu-accelerator: tpu7x
-    cloud.google.com/gke-tpu-topology: 2x2x1  # 4 chips = v7x-4
+    cloud.google.com/gke-tpu-topology: 2x2x1
+    cloud.google.com/gke-nodepool: single-host-vllm
 
-<<<<<<< Updated upstream
+  # DWS Flex tolerations (CRITICAL — without these, autoscaler marks pods
+  # 'unhelpable' and NEVER requests capacity from Google).
   tolerations:
-    - key: google.com/tpu
-      value: present
-      effect: NoSchedule
-    - key: cloud.google.com/gke-spot
-=======
-  affinity:
-    nodeAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        nodeSelectorTerms:
-          - matchExpressions:
-              - key: cloud.google.com/gke-nodepool
-                operator: In
-                values:
-                  - v7x-2x2x1-spot
-
-  # Tolerate spot node taint (user-procured spot TPU capacity).
-  tolerations:
-    - key: cloud.google.com/gke-spot
-      operator: Equal
->>>>>>> Stashed changes
+    - key: "google.com/tpu"
+      operator: "Exists"
+      effect: "NoSchedule"
+    - key: "cloud.google.com/gke-queued"
+      operator: "Equal"
       value: "true"
-      effect: NoSchedule
+      effect: "NoSchedule"
 
   restartPolicy: Never
 
@@ -118,7 +107,7 @@ spec:
         #
         # B) Serving API: add these to VLLM_ARGS to enable /start_profile,
         #    /stop_profile HTTP endpoints:
-        #      --profiler torch --torch-profiler-dir /tmp/profiles
+        #      --profiler-config {"profiler":"torch","torch_profiler_dir":"/tmp/profiles"}
         #    Then: curl -X POST http://<pod>:8000/start_profile
         #          ... send requests ...
         #          curl -X POST http://<pod>:8000/stop_profile

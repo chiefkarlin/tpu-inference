@@ -1,7 +1,11 @@
-# NMC inference Deployment for spot TPU nodes (2x2x1, tpu7x, TP=4).
+# NMC inference Deployment for DWS Flex TPU nodes (2x2x1, tpu7x, TP=4).
 # Uses emptyDir for weights (no PVC — the pre-existing model-weights-pv's
 # underlying GCE PD disk was deleted). Weight download (~3.5min) runs on every
-# pod start. Proven viable: prior runs completed download before spot preemption.
+# pod start. Proven viable: prior runs completed download before preemption.
+#
+# DWS Flex: single-host-vllm pool uses Dynamic Workload Scheduler (Flex Start).
+# GKE auto-taints Flex nodes with google.com/tpu + cloud.google.com/gke-queued.
+# Pods MUST tolerate both taints or the autoscaler won't request capacity.
 #
 # Usage:
 #   kubectl apply -f nmc-v7x-deployment.yaml
@@ -34,16 +38,20 @@ spec:
       nodeSelector:
         cloud.google.com/gke-tpu-accelerator: tpu7x
         cloud.google.com/gke-tpu-topology: 2x2x1
+        cloud.google.com/gke-nodepool: single-host-vllm
 
+      # DWS Flex tolerations (CRITICAL — without these, autoscaler won't
+      # request capacity from Google).
       tolerations:
-        - key: google.com/tpu
-          value: present
-          effect: NoSchedule
-        - key: cloud.google.com/gke-spot
+        - key: "google.com/tpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "cloud.google.com/gke-queued"
+          operator: "Equal"
           value: "true"
-          effect: NoSchedule
+          effect: "NoSchedule"
 
-      terminationGracePeriodSeconds: 30  # fast cleanup on spot preemption
+      terminationGracePeriodSeconds: 30  # fast cleanup on preemption
 
       containers:
         - name: nmc-server

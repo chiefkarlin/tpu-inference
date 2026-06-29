@@ -9,6 +9,10 @@
 # 4/8=0.5 → KV head replication (factor 2). Same ratio as gpt-oss (8 KV heads,
 # TP=16). vLLM TPU path supports this.
 #
+# DWS Flex: multi-tpu7x pool uses Dynamic Workload Scheduler (Flex Start).
+# GKE auto-taints Flex nodes with google.com/tpu + cloud.google.com/gke-queued.
+# Pods MUST tolerate both taints or the autoscaler won't request capacity.
+#
 # Usage:
 #   1. Scale down existing workloads to free 2x2x2 nodes:
 #      kubectl scale lws vllm-qwen -n default --replicas=0
@@ -46,10 +50,15 @@ spec:
         nodeSelector:
           cloud.google.com/gke-tpu-accelerator: tpu7x
           cloud.google.com/gke-tpu-topology: 2x2x2
+          cloud.google.com/gke-nodepool: multi-tpu7x
         tolerations:
           - effect: NoSchedule
             key: google.com/tpu
             operator: Exists
+          - key: "cloud.google.com/gke-queued"
+            operator: "Equal"
+            value: "true"
+            effect: "NoSchedule"
         containers:
           - name: nmc-leader
             image: gcr.io/northam-ce-mlai-tpu/nmc-inference:latest
@@ -130,10 +139,15 @@ spec:
         nodeSelector:
           cloud.google.com/gke-tpu-accelerator: tpu7x
           cloud.google.com/gke-tpu-topology: 2x2x2
+          cloud.google.com/gke-nodepool: multi-tpu7x
         tolerations:
           - effect: NoSchedule
             key: google.com/tpu
             operator: Exists
+          - key: "cloud.google.com/gke-queued"
+            operator: "Equal"
+            value: "true"
+            effect: "NoSchedule"
         containers:
           - name: nmc-worker
             image: gcr.io/northam-ce-mlai-tpu/nmc-inference:latest
