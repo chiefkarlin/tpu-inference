@@ -38,11 +38,28 @@ spec:
     cloud.google.com/gke-tpu-accelerator: tpu7x
     cloud.google.com/gke-tpu-topology: 2x2x1  # 4 chips = v7x-4
 
+<<<<<<< Updated upstream
   tolerations:
     - key: google.com/tpu
       value: present
       effect: NoSchedule
     - key: cloud.google.com/gke-spot
+=======
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: cloud.google.com/gke-nodepool
+                operator: In
+                values:
+                  - v7x-2x2x1-spot
+
+  # Tolerate spot node taint (user-procured spot TPU capacity).
+  tolerations:
+    - key: cloud.google.com/gke-spot
+      operator: Equal
+>>>>>>> Stashed changes
       value: "true"
       effect: NoSchedule
 
