@@ -134,13 +134,19 @@ spec:
           mountPath: /tmp/jax_cache
         - name: dshm
           mountPath: /dev/shm
+      startupProbe:
+        httpGet:
+          path: /health
+          port: 8000
+        initialDelaySeconds: 60
+        periodSeconds: 15
+        failureThreshold: 80  # 60s + 80*15s = 20min for weight download + compile
       readinessProbe:
         httpGet:
           path: /health
           port: 8000
-        initialDelaySeconds: 300  # weight download (61GB) + compile takes time
         periodSeconds: 10
-        failureThreshold: 60  # allow up to 10 min startup
+        failureThreshold: 6  # 60s grace once started
 
   volumes:
     - name: hf-cache
