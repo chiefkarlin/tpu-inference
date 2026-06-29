@@ -1,0 +1,128 @@
+# NMC inference Deployment with persistent weight cache for spot TPU nodes.
+# Uses the pre-existing model-weights-pv (1000GB GCE PD, us-central1-c) to cache
+# the 61GB HuggingFace weights across pod restarts. This cuts retry startup from
+# ~6min (download + shard) to ~2.5min (shard only), fitting in spot windows.
+#
+# Usage:
+#   kubectl apply -f nmc-v7x-deployment.yaml
+#   kubectl rollout status deployment/nmc-v7x-inference
+#   # Once Running + Ready, test via kubectl exec:
+#   kubectl exec deployment/nmc-v7x-inference -- curl -s localhost:8000/v1/completions \
+#     -X POST -H "Content-Type: application/json" \
+#     -d '{"model":"CohereLabs/North-Mini-Code-1.0","prompt":"def hello():","max_tokens":32,"temperature":0}'
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nmc-weights-pvc
+spec:
+  volumeName: model-weights-pv  # bind to pre-existing 1000GB PV in us-central1-c
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: ""  # static binding (PV has empty storageClassName)
+  resources:
+    requests:
+      storage: 1000Gi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nmc-v7x-inference
+  labels:
+    app: nmc-v7x-inference
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate  # RWO PVC: don't start new pod until old one releases volume
+  progressDeadlineSeconds: 1800  # 30min: allow weight download + compile on first run
+  selector:
+    matchLabels:
+      app: nmc-v7x-inference
+  template:
+    metadata:
+      labels:
+        app: nmc-v7x-inference
+    spec:
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+
+      tolerations:
+        - key: google.com/tpu
+          value: present
+          effect: NoSchedule
+        - key: cloud.google.com/gke-spot
+          value: "true"
+          effect: NoSchedule
+
+      terminationGracePeriodSeconds: 30  # fast cleanup on spot preemption
+
+      containers:
+        - name: nmc-server
+          image: gcr.io/northam-ce-mlai-tpu/nmc-inference:latest
+          imagePullPolicy: Always
+          env:
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: token
+            - name: VLLM_ARGS
+              value: >-
+                --model CohereLabs/North-Mini-Code-1.0
+                --port 8000
+                --tensor-parallel-size 4
+                --dtype bfloat16
+                --trust-remote-code
+                --max-model-len 8192
+                --max-num-seqs 8
+                --max-num-batched-tokens 1024
+                --no-enable-prefix-caching
+                --gpu-memory-utilization 0.9
+                --seed 42
+            - name: SKIP_JAX_PRECOMPILE
+              value: "1"
+            - name: VLLM_XLA_CHECK_RECOMPILATION
+              value: "0"
+            - name: VLLM_XLA_CACHE_PATH
+              value: /mnt/weights/jax_cache
+          ports:
+            - containerPort: 8000
+          resources:
+            requests:
+              google.com/tpu: 4
+            limits:
+              google.com/tpu: 4
+          volumeMounts:
+            - name: weights
+              mountPath: /root/.cache/huggingface  # HF cache: persists 61GB weights
+              subPath: hf_cache
+            - name: weights
+              mountPath: /mnt/weights/jax_cache  # JAX compile cache: persists compiled artifacts
+              subPath: jax_cache
+            - name: dshm
+              mountPath: /dev/shm
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            failureThreshold: 80  # 60s + 80*15s = 20min for download + compile
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 10
+            failureThreshold: 6
+
+      volumes:
+        - name: weights
+          persistentVolumeClaim:
+            claimName: nmc-weights-pvc
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
