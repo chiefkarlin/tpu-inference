@@ -1,9 +1,13 @@
 # Kubernetes pod manifest for NMC inference on v7x-4 with PROFILING ENABLED.
 #
-# This is the same as nmc-v7x-pod.yaml but with --profiler torch added to
-# VLLM_ARGS, enabling the /start_profile and /stop_profile HTTP endpoints.
+# This is the same as nmc-v7x-pod.yaml but with profiling enabled via
+# --profiler-config, enabling the /start_profile and /stop_profile HTTP endpoints.
 # Use this for P-4 trace capture AFTER the initial e2e sanity check passes
 # with the standard nmc-v7x-pod.yaml.
+#
+# DWS Flex: single-host-vllm pool uses Dynamic Workload Scheduler (Flex Start).
+# GKE auto-taints Flex nodes with google.com/tpu + cloud.google.com/gke-queued.
+# Pods MUST tolerate both taints or the autoscaler won't request capacity.
 #
 # Usage:
 #   1. Delete the standard pod:      kubectl delete pod nmc-v7x-inference
@@ -26,16 +30,18 @@ spec:
   nodeSelector:
     cloud.google.com/gke-tpu-accelerator: tpu7x
     cloud.google.com/gke-tpu-topology: 2x2x1
+    cloud.google.com/gke-nodepool: single-host-vllm
 
-  affinity:
-    nodeAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        nodeSelectorTerms:
-          - matchExpressions:
-              - key: cloud.google.com/gke-nodepool
-                operator: In
-                values:
-                  - single-host-vllm
+  # DWS Flex tolerations (CRITICAL — without these, autoscaler won't
+  # request capacity from Google).
+  tolerations:
+    - key: "google.com/tpu"
+      operator: "Exists"
+      effect: "NoSchedule"
+    - key: "cloud.google.com/gke-queued"
+      operator: "Equal"
+      value: "true"
+      effect: "NoSchedule"
 
   restartPolicy: Never
 
@@ -63,8 +69,7 @@ spec:
             --no-enable-prefix-caching
             --gpu-memory-utilization 0.9
             --seed 42
-            --profiler torch
-            --torch-profiler-dir /tmp/profiles
+            --profiler-config {"profiler":"torch","torch_profiler_dir":"/tmp/profiles"}
         - name: SKIP_JAX_PRECOMPILE
           value: "1"
         - name: VLLM_XLA_CHECK_RECOMPILATION
