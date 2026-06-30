@@ -248,6 +248,92 @@ def _decode_core(
             kv_caches, token_buffer, expert_buffer)
 
 
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "model_fn",
+        "compute_logits_fn",
+        "sample_fn",
+        "mesh",
+        "layer_name_to_kvcache_index",
+        "is_first_rank",
+        "is_last_rank",
+    ),
+    donate_argnames=("kv_caches", ),
+    # Hoisted here from the model's step_fun: JAX forbids compiler_options on
+    # a nested jit, so they must live on this top-level jit instead.
+    compiler_options={
+        "xla_tpu_all_gather_collective_matmul_mode": "post_spmd_conservative",
+        "xla_tpu_reduce_scatter_collective_matmul_mode":
+        "post_spmd_conservative",
+        "xla_tpu_use_minor_sharding_for_major_trivial_input": "true"
+    },
+)
+def single_step_decode(
+    *,
+    state,
+    kv_caches,
+    rng,
+    input_ids,
+    attn_metadata,
+    input_positions,
+    logits_indices,
+    sampling_metadata,
+    inputs_embeds,
+    lora_metadata,
+    intermediate_tensors,
+    model_fn,
+    compute_logits_fn,
+    sample_fn,
+    mesh,
+    layer_name_to_kvcache_index,
+    is_first_rank,
+    is_last_rank,
+):
+    """Single-step fused decode: model + select + logits + sample in one jit.
+
+    Fuses the 4 separate XLA dispatches of the standard decode path into a
+    single jitted function to eliminate per-dispatch runtime overhead
+    (~1-5 ms each).  Unlike ``continue_decode``, this does NOT use a
+    while_loop and keeps ``_select_from_array`` inlined (via array indexing)
+    to avoid the logits-padding issue that hurt continue_decode throughput.
+
+    The inlined gather ``hidden_states[logits_indices]`` replaces the
+    separate ``_select_from_array_fn`` shard_map dispatch.  When both
+    operands share the same ATTN_DATA sharding, GSPMD performs a local
+    gather per shard (equivalent to the shard_map version but without a
+    separate dispatch boundary).  In TP-only mode (data=1) the gather is
+    trivially global on a single shard.
+
+    Returns ``(kv_caches, next_tokens, expert_indices)``.
+    """
+    # 1. Forward pass (dispatch 1 fused)
+    kv_caches, hidden_states, _, expert_indices = model_fn(
+        state,
+        kv_caches,
+        input_ids,
+        attn_metadata,
+        inputs_embeds,
+        input_positions,
+        layer_name_to_kvcache_index,
+        lora_metadata,
+        intermediate_tensors,
+        is_first_rank,
+        is_last_rank,
+    )
+    # 2. Select logits positions (dispatch 2 fused — avoids padding).
+    #    Gathers the last-token hidden state per request, reducing from
+    #    padded_total_num_scheduled_tokens to padded_num_reqs rows so that
+    #    logits match sampling_metadata (also padded_num_reqs).
+    hidden_states = hidden_states[logits_indices]
+    # 3. Compute logits (dispatch 3 fused)
+    logits = compute_logits_fn(state, hidden_states, None)
+    logits = logits.astype(jnp.float32)
+    # 4. Sample (dispatch 4 fused)
+    next_tokens, _ = sample_fn(rng, mesh, logits, sampling_metadata)
+    return kv_caches, next_tokens, expert_indices
+
+
 def continue_decode(
     state: dict,
     model_fn: Callable,

@@ -73,7 +73,8 @@ from tpu_inference.models.jax.utils.weight_utils import (
     shard_put, transfer_state_with_mappings)
 from tpu_inference.runner import utils as runner_utils
 from tpu_inference.runner.compilation_manager import CompilationManager
-from tpu_inference.runner.decode_loop import TpuSamplingState, continue_decode
+from tpu_inference.runner.decode_loop import (
+    TpuSamplingState, continue_decode, single_step_decode)
 from tpu_inference.runner.input_batch import CachedRequestState, InputBatch
 from tpu_inference.runner.kv_cache_manager import KVCacheManager
 from tpu_inference.runner.lora_utils import LoraUtils
@@ -565,6 +566,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         """Generative model or pooling model select different computations."""
         self.enable_continue_decode = self.vllm_config.additional_config.get(
             "enable_continue_decode", False)
+        self.enable_single_step_decode = self.vllm_config.additional_config.get(
+            "enable_single_step_decode", False)
         self.static_max_decode_steps = self.vllm_config.additional_config.get(
             "max_decode_steps", DEFAULT_MAX_DECODE_STEPS)
         self.eos_token_id = runner_utils.get_eos_token_id(self.model_config)
@@ -1223,6 +1226,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if is_decode_only and self.enable_continue_decode:
             return self._execute_continue_decode(scheduler_output)
 
+        if is_decode_only and self.enable_single_step_decode:
+            return self._execute_single_step_decode(scheduler_output)
+
         # TODO(pooyam): I guess we can remove returning sampling_metadata in `_prepare_inputs` after https://github.com/njhill/vllm/commit/b7433ca1a47732394b1bdea4099d98389515954b
         (
             input_ids,
@@ -1611,6 +1617,135 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             "continue_decode finished: actual steps: %d, reason: %s, initial_active_reqs: %d (max_steps: %d, EOS hits: %d)",
             actual_steps, termination_reason, num_reqs, max_decode_steps,
             num_eos_hits)
+
+        output = ModelRunnerOutput(
+            req_ids=self.input_batch.req_ids[:num_reqs],
+            req_id_to_index=self.input_batch.req_id_to_index.copy(),
+            sampled_token_ids=sampled_token_ids,
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            kv_connector_output=kv_connector_output,
+        )
+
+        if routed_experts is not None:
+            output.routed_experts = routed_experts
+
+        self._continue_decode_output = output
+        return None
+
+    def _execute_single_step_decode(
+        self,
+        scheduler_output: "VllmSchedulerOutput",
+    ) -> None:
+        """Execute a single decode step with all 4 dispatches fused into 1 jit.
+
+        Unlike ``continue_decode`` (which wraps N steps in a while_loop and
+        computes logits for ALL token-padded slots), this fuses model +
+        select + logits + sample into a single jitted dispatch with NO
+        while_loop and keeps ``_select_from_array`` inlined to avoid the
+        logits-padding issue.  Eliminates ~3-15 ms/step of per-dispatch XLA
+        runtime overhead.
+        """
+        (
+            input_ids,
+            input_positions,
+            attn_metadata,
+            sampling_metadata,
+            logits_indices,
+            spec_decode_metadata,
+            logits_indices_selector,
+            padded_num_reqs,
+            req_ids_dp,
+            padded_num_scheduled_tokens_per_dp_rank,
+        ) = self._prepare_inputs(scheduler_output)
+
+        # Decode-only: no multimodal embeddings.
+        input_ids, inputs_embeds = self._get_input_ids_embeds(
+            input_ids, None, None)
+        lora_metadata = self.lora_utils.extract_lora_metadata()
+
+        # Split RNG for sampling (mirrors standard path in _sample_from_logits).
+        if sampling_metadata.do_sampling:
+            self.rng_params_for_sampling, step_rng = jax.random.split(
+                self.rng_params_for_sampling)
+        else:
+            step_rng = self.rng_params_for_sampling
+
+        from tpu_inference.layers.jax.sample.sampling import sample
+
+        with self.maybe_forbid_compile, \
+             set_forward_context(None, self.vllm_config), \
+             self.maybe_get_kv_connector_output(
+                 scheduler_output) as kv_connector_output:
+            kv_caches, next_tokens, expert_indices = single_step_decode(
+                state=self.state_leaves,
+                kv_caches=self.kv_caches,
+                rng=step_rng,
+                input_ids=input_ids,
+                attn_metadata=attn_metadata,
+                input_positions=input_positions,
+                logits_indices=logits_indices,
+                sampling_metadata=sampling_metadata,
+                inputs_embeds=inputs_embeds,
+                lora_metadata=lora_metadata,
+                intermediate_tensors=None,
+                model_fn=getattr(self.model, "step_fn_no_options",
+                                 self.model_fn),
+                compute_logits_fn=self.compute_logits_fn,
+                sample_fn=sample,
+                mesh=self.mesh,
+                layer_name_to_kvcache_index=tuple(
+                    self.layer_name_to_kvcache_index.items()),
+                is_first_rank=self.is_first_rank,
+                is_last_rank=self.is_last_rank,
+            )
+
+        self.kv_caches = kv_caches
+
+        # Transfer next_tokens to host and realign to request order.
+        next_tokens_cpu = np.asarray(jax.device_get(next_tokens))
+        if logits_indices_selector is not None:
+            next_tokens_cpu = next_tokens_cpu[logits_indices_selector]
+
+        num_reqs = self.input_batch.num_reqs
+        sampled_token_ids = []
+        for req_idx in range(num_reqs):
+            token_id = int(next_tokens_cpu[req_idx])
+            sampled_token_ids.append([token_id])
+
+            # Update input batch state (mirror standard path).
+            req_id = self.input_batch.req_ids[req_idx]
+            req_state = self.requests.get(req_id)
+            if req_state is not None:
+                start_idx = self.input_batch.num_tokens_no_spec[req_idx]
+                end_idx = start_idx + 1
+                if req_idx < self.max_num_reqs and end_idx <= self.max_model_len:
+                    self.input_batch.token_ids_cpu[
+                        req_idx, start_idx:end_idx] = token_id
+                    self.input_batch.num_tokens_no_spec[req_idx] = end_idx
+                    self.input_batch.num_tokens[req_idx] = end_idx
+                    req_state.output_token_ids.append(token_id)
+
+            if hasattr(attn_metadata,
+                       "seq_lens_cpu") and attn_metadata.seq_lens_cpu is not None:
+                attn_metadata.seq_lens_cpu[req_idx] += 1
+
+        # Handle routed experts (MoE).
+        routed_experts = None
+        if (getattr(self.vllm_config.model_config,
+                    "enable_return_routed_experts", False)
+                and expert_indices is not None):
+            expert_indices_cpu = np.asarray(jax.device_get(expert_indices))
+            routed_experts = _reconstruct_routed_experts(
+                runner=self,
+                scheduler_output=scheduler_output,
+                expert_indices_cpu=expert_indices_cpu,
+                req_ids=self.input_batch.req_ids[:num_reqs],
+                req_ids_dp=req_ids_dp,
+                padded_num_scheduled_tokens_per_dp_rank=
+                padded_num_scheduled_tokens_per_dp_rank,
+            )
 
         output = ModelRunnerOutput(
             req_ids=self.input_batch.req_ids[:num_reqs],
