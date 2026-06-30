@@ -187,25 +187,28 @@ class Cohere2MoeSparseMoeBlock(JaxModule):
         # The mutual-exclusion guard (from deepseek_v3.py:1144) ensures EP is
         # only activated when total tensor parallelism is 1; otherwise the
         # experts are replicated and GMM_TP is used (current baseline).
-        expert_axis_name = ShardingAxisName.EXPERT
-        num_expert_parallelism = get_expert_parallelism(
-            expert_axis_name, mesh)
         total_tensor_parallelism = (
             vllm_config.sharding_config.tp_size
             * vllm_config.sharding_config.attn_dp_size)
-        use_ep = (num_expert_parallelism > 1
-                  and total_tensor_parallelism == 1)
-        moe_backend = select_moe_backend(use_ep)
+        use_ep = total_tensor_parallelism == 1
 
         if use_ep:
             # EP mode: shard experts on the EXPERT axis; replicate D/F.
-            edf_sharding = (ShardingAxisName.EXPERT, None, None)
-            efd_sharding = (ShardingAxisName.EXPERT, None, None)
+            expert_axis_name = ShardingAxisName.EXPERT
+            num_expert_parallelism = get_expert_parallelism(
+                expert_axis_name, mesh)
+            use_ep = num_expert_parallelism > 1
+            edf_sharding = P(ShardingAxisName.EXPERT, None, None)
+            efd_sharding = P(ShardingAxisName.EXPERT, None, None)
         else:
             # TP mode: replicate all experts on each device (GMM_TP handles
             # the all-reduce internally).
-            edf_sharding = (None, None, None)
-            efd_sharding = (None, None, None)
+            expert_axis_name = None
+            num_expert_parallelism = 1
+            edf_sharding = P(None, None, None)
+            efd_sharding = P(None, None, None)
+
+        moe_backend = select_moe_backend(use_ep)
 
         # Router: mlp.gate (hidden_size -> num_experts). JaxLinear so the
         # weight auto-transposes 2D under JaxAutoWeightsLoader.

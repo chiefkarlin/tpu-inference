@@ -160,7 +160,7 @@ class Cohere2Attention(JaxModule):
     # (4096) so a full sliding-window prefill is one launch. Set to ``None``
     # to disable the dedicated prefill path (all prefill falls through to the
     # mixed kernel).
-    prefill_chunk_size: Optional[int] = 4096
+    prefill_chunk_size: Optional[int] = None
 
     # Quantization scales (per-tensor; 1.0 when unquantized)
     _q_scale: float = 1.0

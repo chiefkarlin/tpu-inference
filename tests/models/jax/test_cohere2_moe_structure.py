@@ -357,17 +357,17 @@ class TestExpertParallelismConfig(unittest.TestCase):
         # The if use_ep / else branching must exist.
         self.assertIn("if use_ep:", src,
                       "sharding must branch on use_ep")
-        # EP branch: edf_sharding = (ShardingAxisName.EXPERT, None, None)
+        # EP branch: edf_sharding = P(ShardingAxisName.EXPERT, None, None)
         self.assertRegex(
             src,
-            r'edf_sharding\s*=\s*\(\s*ShardingAxisName\.EXPERT\s*,\s*None\s*,'
-            r'\s*None\s*\)',
-            "EP branch must set edf_sharding=(EXPERT, None, None)")
-        # TP branch: edf_sharding = (None, None, None)
+            r'edf_sharding\s*=\s*P\(\s*ShardingAxisName\.EXPERT\s*,\s*None'
+            r'\s*,\s*None\s*\)',
+            "EP branch must set edf_sharding=P(EXPERT, None, None)")
+        # TP branch: edf_sharding = P(None, None, None)
         self.assertRegex(
             src,
-            r'edf_sharding\s*=\s*\(\s*None\s*,\s*None\s*,\s*None\s*\)',
-            "TP branch must set edf_sharding=(None, None, None)")
+            r'edf_sharding\s*=\s*P\(\s*None\s*,\s*None\s*,\s*None\s*\)',
+            "TP branch must set edf_sharding=P(None, None, None)")
 
     def test_edf_sharding_not_hardcoded_p_none(self):
         """edf_sharding must NOT be hardcoded P(None,) — must be conditional
@@ -676,25 +676,26 @@ class TestCohere2AttentionWiring(unittest.TestCase):
             "chunk_prefill_size must be passed to the kernel (Phase 2: "
             "enables dedicated PREFILL launch)")
 
-    def test_prefill_chunk_size_default_4096(self):
-        """prefill_chunk_size field must default to 4096 (NMC sliding_window)."""
+    def test_prefill_chunk_size_default_none(self):
+        """prefill_chunk_size field must default to None (disabled by default;
+        enabling it with a static q_len corrupted KV cache for short prompts)."""
         attn_cls = _find_class(self.tree, "Cohere2Attention")
         src = ast.unparse(attn_cls)
         self.assertIn("prefill_chunk_size", src,
                       "prefill_chunk_size field must exist (Phase 2)")
-        # The default value must be 4096 (NMC's sliding_window).
-        found_4096_default = False
+        # The default value must be None (disabled by default for safety).
+        found_none_default = False
         for node in ast.walk(attn_cls):
             if isinstance(node, ast.AnnAssign):
                 if (node.target and isinstance(node.target, ast.Name)
                         and node.target.id == "prefill_chunk_size"
                         and node.value is not None
                         and isinstance(node.value, ast.Constant)
-                        and node.value.value == 4096):
-                    found_4096_default = True
+                        and node.value.value is None):
+                    found_none_default = True
         self.assertTrue(
-            found_4096_default,
-            "prefill_chunk_size must default to 4096 (NMC sliding_window)")
+            found_none_default,
+            "prefill_chunk_size must default to None (disabled by default)")
 
     def test_mixed_and_prefill_block_sizes_fields_exist(self):
         """mixed_block_sizes and prefill_block_sizes fields must exist (Phase 2)."""
