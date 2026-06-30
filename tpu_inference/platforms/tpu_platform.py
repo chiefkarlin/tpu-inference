@@ -414,6 +414,16 @@ class TpuPlatform(Platform):
             # (unlike continue_decode). The fused dispatch returns
             # next_tokens which async can copy_to_host_async.
 
+            # Apply the same scheduler patch as continue_decode.
+            # The patch modifies Scheduler._update_request_with_output to
+            # correctly advance num_computed_tokens for the fused decode
+            # path, and sets num_lookahead_tokens in Scheduler.__init__.
+            # Without this patch, the scheduler processes fused-decode
+            # outputs incorrectly, producing garbled tokens.
+            from tpu_inference.core.sched.utils import \
+                patch_vllm_scheduler_for_continue_decode
+            patch_vllm_scheduler_for_continue_decode()
+
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
         # TODO: TPU still sets block_size in check_and_update_config.
