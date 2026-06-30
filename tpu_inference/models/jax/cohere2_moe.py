@@ -178,12 +178,34 @@ class Cohere2MoeSparseMoeBlock(JaxModule):
         dtype = vllm_config.model_config.dtype
         quant_config = vllm_config.quant_config
 
-        # --- Sharding config (matches qwen3_moe) ---
-        edf_sharding = (None, None, None)
-        expert_axis_name = edf_sharding[0]
-        num_expert_parallelism = get_expert_parallelism(expert_axis_name, mesh)
-        use_ep = num_expert_parallelism > 1
+        # --- Sharding config (EP when available, TP fallback) ---
+        # Expert parallelism shards the 128 experts across devices (e.g.
+        # 32/device on TP=4), eliminating the 2 fused TP all-reduces per
+        # decode step. EP consumes the parallelism budget, so attention must
+        # move from TP to DP (requires NEW_MODEL_DESIGN=True + launch config
+        # expert_parallelism=N, tensor_parallelism=1, enable_dp_attention=true).
+        # The mutual-exclusion guard (from deepseek_v3.py:1144) ensures EP is
+        # only activated when total tensor parallelism is 1; otherwise the
+        # experts are replicated and GMM_TP is used (current baseline).
+        expert_axis_name = ShardingAxisName.EXPERT
+        num_expert_parallelism = get_expert_parallelism(
+            expert_axis_name, mesh)
+        total_tensor_parallelism = (
+            vllm_config.sharding_config.tp_size
+            * vllm_config.sharding_config.attn_dp_size)
+        use_ep = (num_expert_parallelism > 1
+                  and total_tensor_parallelism == 1)
         moe_backend = select_moe_backend(use_ep)
+
+        if use_ep:
+            # EP mode: shard experts on the EXPERT axis; replicate D/F.
+            edf_sharding = (ShardingAxisName.EXPERT, None, None)
+            efd_sharding = (ShardingAxisName.EXPERT, None, None)
+        else:
+            # TP mode: replicate all experts on each device (GMM_TP handles
+            # the all-reduce internally).
+            edf_sharding = (None, None, None)
+            efd_sharding = (None, None, None)
 
         # Router: mlp.gate (hidden_size -> num_experts). JaxLinear so the
         # weight auto-transposes 2D under JaxAutoWeightsLoader.
@@ -219,8 +241,8 @@ class Cohere2MoeSparseMoeBlock(JaxModule):
             mesh=mesh,
             activation_ffw_td=P(ShardingAxisName.MLP_DATA, None),
             activation_ffw_ted=P(ShardingAxisName.MLP_DATA, None, None),
-            edf_sharding=P(None, ),
-            efd_sharding=P(None, ),
+            edf_sharding=edf_sharding,
+            efd_sharding=efd_sharding,
             apply_expert_weight_before_computation=False,
             expert_axis_name=expert_axis_name,
             num_expert_parallelism=num_expert_parallelism,
