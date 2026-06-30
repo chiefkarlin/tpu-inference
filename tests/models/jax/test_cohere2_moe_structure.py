@@ -310,6 +310,98 @@ class TestMoEConfig(unittest.TestCase):
                       "expert intermediate must be config.intermediate_size")
 
 
+class TestExpertParallelismConfig(unittest.TestCase):
+    """Verify Phase 3 expert-parallelism sharding + mutual-exclusion guard."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tree = _parse(_COHERE2_MOE_PATH)
+
+    def test_expert_axis_name_is_expert(self):
+        """expert_axis_name must be ShardingAxisName.EXPERT (Phase 3)."""
+        moe_block_cls = _find_class(self.tree, "Cohere2MoeSparseMoeBlock")
+        init_method = _find_method(moe_block_cls, "__init__")
+        src = ast.unparse(init_method)
+        self.assertIn("ShardingAxisName.EXPERT", src,
+                      "expert_axis_name must be ShardingAxisName.EXPERT")
+
+    def test_mutual_exclusion_guard_present(self):
+        """The mutual-exclusion guard from deepseek_v3.py:1144 must be present.
+
+        EP is only activated when total_tensor_parallelism == 1 (TP is 1,
+        attention runs in DP mode). Without this, EP sharding would conflict
+        with TP and crash.
+        """
+        moe_block_cls = _find_class(self.tree, "Cohere2MoeSparseMoeBlock")
+        init_method = _find_method(moe_block_cls, "__init__")
+        src = ast.unparse(init_method)
+        self.assertIn("total_tensor_parallelism", src,
+                      "mutual-exclusion guard must compute total_tensor_parallelism")
+        self.assertIn("tp_size", src,
+                      "guard must use sharding_config.tp_size")
+        self.assertIn("attn_dp_size", src,
+                      "guard must use sharding_config.attn_dp_size")
+        self.assertIn("total_tensor_parallelism == 1", src,
+                      "guard must check total_tensor_parallelism == 1")
+
+    def test_conditional_sharding_ep_vs_tp(self):
+        """Sharding must be conditional: EP shards experts, TP replicates.
+
+        Deepseek_v3 (L888-902) makes edf/efd_sharding conditional on the
+        backend. NMC must do the same: when use_ep=True, shard on EXPERT
+        axis; when use_ep=False, replicate (None,None,None) for GMM_TP.
+        """
+        moe_block_cls = _find_class(self.tree, "Cohere2MoeSparseMoeBlock")
+        init_method = _find_method(moe_block_cls, "__init__")
+        src = ast.unparse(init_method)
+        # The if use_ep / else branching must exist.
+        self.assertIn("if use_ep:", src,
+                      "sharding must branch on use_ep")
+        # EP branch: edf_sharding = (ShardingAxisName.EXPERT, None, None)
+        self.assertRegex(
+            src,
+            r'edf_sharding\s*=\s*\(\s*ShardingAxisName\.EXPERT\s*,\s*None\s*,'
+            r'\s*None\s*\)',
+            "EP branch must set edf_sharding=(EXPERT, None, None)")
+        # TP branch: edf_sharding = (None, None, None)
+        self.assertRegex(
+            src,
+            r'edf_sharding\s*=\s*\(\s*None\s*,\s*None\s*,\s*None\s*\)',
+            "TP branch must set edf_sharding=(None, None, None)")
+
+    def test_edf_sharding_not_hardcoded_p_none(self):
+        """edf_sharding must NOT be hardcoded P(None,) — must be conditional
+        (Phase 3 regression guard)."""
+        moe_block_cls = _find_class(self.tree, "Cohere2MoeSparseMoeBlock")
+        init_method = _find_method(moe_block_cls, "__init__")
+        for node in ast.walk(init_method):
+            if isinstance(node, ast.Call) and _call_func_name(
+                    node) == "JaxMoE":
+                for kw in node.keywords:
+                    if kw.arg == "edf_sharding":
+                        val_src = ast.unparse(kw.value)
+                        self.assertNotEqual(
+                            val_src, "P(None)",
+                            "edf_sharding must not be hardcoded P(None) — "
+                            "must be the conditional variable (Phase 3)")
+                        return
+        self.fail("JaxMoE edf_sharding kwarg not found")
+
+    def test_moe_backend_passed_to_jaxmoe(self):
+        """moe_backend must be passed to JaxMoE (selects GMM_TP vs GMM_EP)."""
+        moe_block_cls = _find_class(self.tree, "Cohere2MoeSparseMoeBlock")
+        init_method = _find_method(moe_block_cls, "__init__")
+        found = False
+        for node in ast.walk(init_method):
+            if isinstance(node, ast.Call) and _call_func_name(
+                    node) == "JaxMoE":
+                for kw in node.keywords:
+                    if kw.arg == "moe_backend":
+                        found = True
+        self.assertTrue(
+            found, "moe_backend must be passed to JaxMoE (Phase 3)")
+
+
 class TestDenseLayer0Intermediate(unittest.TestCase):
     """REGRESSION: the dense layer 0 must use prefix_dense_intermediate_size.
 
