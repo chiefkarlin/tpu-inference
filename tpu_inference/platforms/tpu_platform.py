@@ -368,6 +368,8 @@ class TpuPlatform(Platform):
 
         enable_continue_decode = vllm_config.additional_config.get(
             "enable_continue_decode", False)
+        enable_single_step_decode = vllm_config.additional_config.get(
+            "enable_single_step_decode", False)
         is_pooling_model = vllm_config.model_config.runner_type == "pooling"
         async_scheduling = vllm_config.scheduler_config.async_scheduling
 
@@ -391,6 +393,26 @@ class TpuPlatform(Platform):
             from tpu_inference.core.sched.utils import \
                 patch_vllm_scheduler_for_continue_decode
             patch_vllm_scheduler_for_continue_decode()
+
+        if enable_single_step_decode:
+            if parallel_config.pipeline_parallel_size > 1:
+                raise ValueError(
+                    "single_step_decode is not supported with pipeline "
+                    "parallelism")
+            if is_pooling_model:
+                raise ValueError(
+                    "single_step_decode is not supported for pooling models")
+            if enable_continue_decode:
+                raise ValueError(
+                    "single_step_decode and continue_decode are mutually "
+                    "exclusive; enable only one")
+            if vllm_config.speculative_config is not None:
+                raise ValueError(
+                    "single_step_decode is not supported with speculative "
+                    "decoding")
+            # NOTE: single_step_decode IS compatible with async_scheduling
+            # (unlike continue_decode). The fused dispatch returns
+            # next_tokens which async can copy_to_host_async.
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
