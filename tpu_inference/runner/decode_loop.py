@@ -295,15 +295,17 @@ def single_step_decode(
     Fuses the 4 separate XLA dispatches of the standard decode path into a
     single jitted function to eliminate per-dispatch runtime overhead
     (~1-5 ms each).  Unlike ``continue_decode``, this does NOT use a
-    while_loop and keeps ``_select_from_array`` inlined (via array indexing)
-    to avoid the logits-padding issue that hurt continue_decode throughput.
+    while_loop and keeps ``_select_from_array`` inlined to avoid the
+    logits-padding issue that hurt continue_decode throughput.
 
-    The inlined gather ``hidden_states[logits_indices]`` replaces the
-    separate ``_select_from_array_fn`` shard_map dispatch.  When both
-    operands share the same ATTN_DATA sharding, GSPMD performs a local
-    gather per shard (equivalent to the shard_map version but without a
-    separate dispatch boundary).  In TP-only mode (data=1) the gather is
-    trivially global on a single shard.
+    The select is done on LOGITS (after compute_logits) rather than on
+    hidden_states (before compute_logits).  This avoids GSPMD dynamic
+    indexing issues with hidden_states (which has complex sharding
+    interactions between ATTN_DATA and MODEL axes inside the fused jit).
+    Logits have a simpler sharding (MLP_DATA on the token dimension) and
+    the select produces the correct padded_num_reqs rows to match
+    sampling_metadata.  The overhead of computing logits for a few extra
+    padding rows is negligible (lm_head is a small fraction of step time).
 
     Returns ``(kv_caches, next_tokens, expert_indices)``.
     """
@@ -321,14 +323,17 @@ def single_step_decode(
         is_first_rank,
         is_last_rank,
     )
-    # 2. Select logits positions (dispatch 2 fused — avoids padding).
-    #    Gathers the last-token hidden state per request, reducing from
-    #    padded_total_num_scheduled_tokens to padded_num_reqs rows so that
-    #    logits match sampling_metadata (also padded_num_reqs).
-    hidden_states = hidden_states[logits_indices]
-    # 3. Compute logits (dispatch 3 fused)
+    # 2. Compute logits for ALL token positions (dispatch 3 fused).
+    #    Like continue_decode, compute logits before selecting. This avoids
+    #    GSPMD dynamic-indexing issues with hidden_states (sharded on
+    #    ATTN_DATA) inside the fused jit.
     logits = compute_logits_fn(state, hidden_states, None)
     logits = logits.astype(jnp.float32)
+    # 3. Select logits for relevant positions (dispatch 2 fused).
+    #    Gathers the last-token logits per request, reducing from
+    #    padded_total_num_scheduled_tokens to padded_num_reqs rows so that
+    #    logits match sampling_metadata (also padded_num_reqs).
+    logits = logits[logits_indices]
     # 4. Sample (dispatch 4 fused)
     next_tokens, _ = sample_fn(rng, mesh, logits, sampling_metadata)
     return kv_caches, next_tokens, expert_indices
