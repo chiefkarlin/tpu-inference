@@ -1,36 +1,26 @@
 # NMC inference Deployment for DWS Flex TPU nodes (2x2x1, tpu7x, TP=4).
-# Uses emptyDir for weights (no PVC — the pre-existing model-weights-pv's
-# underlying GCE PD disk was deleted). Weight download (~3.5min) runs on every
-# pod start. Proven viable: prior runs completed download before preemption.
+# Uses emptyDir for weights (no PVC). Weight download (~3.5min) per pod start.
 #
 # DWS Flex: single-host-vllm pool uses Dynamic Workload Scheduler (Flex Start).
 # GKE auto-taints Flex nodes with google.com/tpu + cloud.google.com/gke-queued.
 # Pods MUST tolerate both taints or the autoscaler won't request capacity.
 #
-# continue_decode: enabled via additional_config JSON ConfigMap mounted at
-# /etc/vllm-config/additional_config.json (vLLM's default path). This fuses
-# N decode steps into one jitted while_loop, eliminating per-step pjit dispatch.
+# Async scheduling: overlaps previous step's D2H transfer with next step's
+# input prep + forward dispatch. Confirmed +8-29% throughput improvement at
+# c4-c16 over Config B baseline. Uses explicit command/args array (NOT
+# VLLM_ARGS env) to avoid shell word-splitting issues.
 #
 # Usage:
 #   kubectl apply -f nmc-v7x-deployment.yaml
 #   kubectl rollout status deployment/nmc-v7x-inference
 #   # Once Running + Ready, test via kubectl exec:
-#   kubectl exec deployment/nmc-v7x-inference -- curl -s localhost:8000/v1/completions \
-#     -X POST -H "Content-Type: application/json" \
-#     -d '{"model":"CohereLabs/North-Mini-Code-1.0","prompt":"def hello():","max_tokens":32,"temperature":0}'
-
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: nmc-additional-config
-  labels:
-    app: nmc-v7x-inference
-data:
-  additional_config.json: |
-    {
-      "enable_continue_decode": true
-    }
+#   kubectl exec deployment/nmc-v7x-inference -- python3 -c "
+#   import urllib.request, json
+#   req = urllib.request.Request('http://localhost:8000/v1/completions',
+#       data=json.dumps({'model':'CohereLabs/North-Mini-Code-1.0','prompt':'def hello():','max_tokens':32,'temperature':0}).encode(),
+#       headers={'Content-Type':'application/json'})
+#   print(json.loads(urllib.request.urlopen(req).read())['choices'][0]['text'])
+#   "
 
 ---
 apiVersion: apps/v1
@@ -67,6 +57,11 @@ spec:
           operator: "Equal"
           value: "true"
           effect: "NoSchedule"
+        # Tolerate disk-pressure taint (leftover emptyDir data from prior
+        # weight downloads). Remove once node disk is cleaned.
+        - key: "node.kubernetes.io/disk-pressure"
+          operator: "Exists"
+          effect: "NoSchedule"
 
       terminationGracePeriodSeconds: 30  # fast cleanup on preemption
 
@@ -74,25 +69,40 @@ spec:
         - name: nmc-server
           image: gcr.io/northam-ce-mlai-tpu/nmc-inference:latest
           imagePullPolicy: Always
+          # Explicit command+args array (NOT VLLM_ARGS env) to avoid shell
+          # word-splitting. Async scheduling confirmed working.
+          command:
+            - python3
+            - -m
+            - vllm.entrypoints.openai.api_server
+          args:
+            - --model
+            - CohereLabs/North-Mini-Code-1.0
+            - --port
+            - "8000"
+            - --tensor-parallel-size
+            - "4"
+            - --dtype
+            - bfloat16
+            - --trust-remote-code
+            - --max-model-len
+            - "8192"
+            - --max-num-seqs
+            - "32"
+            - --max-num-batched-tokens
+            - "4096"
+            - --no-enable-prefix-caching
+            - --gpu-memory-utilization
+            - "0.9"
+            - --seed
+            - "42"
+            - --async-scheduling
           env:
             - name: HUGGING_FACE_HUB_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: hf-token-secret
                   key: token
-            - name: VLLM_ARGS
-              value: >-
-                --model CohereLabs/North-Mini-Code-1.0
-                --port 8000
-                --tensor-parallel-size 4
-                --dtype bfloat16
-                --trust-remote-code
-                --max-model-len 8192
-                --max-num-seqs 32
-                --max-num-batched-tokens 4096
-                --no-enable-prefix-caching
-                --gpu-memory-utilization 0.9
-                --seed 42
             - name: SKIP_JAX_PRECOMPILE
               value: "1"
             - name: VLLM_XLA_CHECK_RECOMPILATION
@@ -111,9 +121,6 @@ spec:
               mountPath: /root/.cache/huggingface
             - name: dshm
               mountPath: /dev/shm
-            - name: additional-config
-              mountPath: /etc/vllm-config
-              readOnly: true
           startupProbe:
             httpGet:
               path: /health
@@ -135,6 +142,3 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 8Gi
-        - name: additional-config
-          configMap:
-            name: nmc-additional-config
