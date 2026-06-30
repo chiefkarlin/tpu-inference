@@ -1640,168 +1640,24 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
     ) -> None:
         """Execute a single decode step with all 4 dispatches fused into 1 jit.
 
-        Unlike ``continue_decode`` (which wraps N steps in a while_loop),
-        this fuses model + logits + sample into a single jitted dispatch
-        with NO while_loop.  Follows continue_decode's proven pattern:
-        compute logits for ALL token-padded positions and sample for ALL
-        positions (with sampling_metadata padded to token_batch_size).
-        The relevant tokens are extracted on the host using
-        ``logits_indices``.  Eliminates ~3-15 ms/step of per-dispatch XLA
-        runtime overhead.
+        This implementation DELEGATES to continue_decode with
+        max_decode_steps=1 as a diagnostic baseline. continue_decode is the
+        PROVEN fused path (correctness-verified). By limiting it to 1 step,
+        we get a single fused dispatch without the while_loop overhead
+        while reusing continue_decode's battle-tested wiring.
+
+        If this produces correct output, the bug was in the custom
+        _execute_single_step_decode wiring. If it also garbles, the problem
+        is in the single_step_decode concept itself.
         """
-        (
-            input_ids,
-            input_positions,
-            attn_metadata,
-            sampling_metadata,
-            logits_indices,
-            spec_decode_metadata,
-            logits_indices_selector,
-            padded_num_reqs,
-            req_ids_dp,
-            padded_num_scheduled_tokens_per_dp_rank,
-        ) = self._prepare_inputs(scheduler_output)
-
-        token_batch_size = input_ids.shape[0]
-
-        # Pad sampling_metadata to token_batch_size (same as continue_decode).
-        # The fused jit computes logits + samples for ALL token-padded
-        # positions, so sampling_metadata must match.  Padding slots use
-        # default sampling params and their sampled tokens are discarded
-        # on the host via logits_indices extraction.
-        if (sampling_metadata.temperature is not None
-                and token_batch_size != padded_num_reqs):
-            _pad_len = token_batch_size - padded_num_reqs
-            _pad_temp = jnp.full((_pad_len, ), 1.0,
-                                 dtype=sampling_metadata.temperature.dtype)
-            _pad_topk = jnp.zeros((_pad_len, ),
-                                  dtype=sampling_metadata.top_k.dtype)
-            _pad_topp = jnp.ones((_pad_len, ),
-                                 dtype=sampling_metadata.top_p.dtype)
-            sampling_metadata = TPUSupportedSamplingMetadata(
-                temperature=jnp.concatenate(
-                    [sampling_metadata.temperature, _pad_temp]),
-                top_k=jnp.concatenate(
-                    [sampling_metadata.top_k, _pad_topk]),
-                top_p=jnp.concatenate(
-                    [sampling_metadata.top_p, _pad_topp]),
-                _cache_collision_dummy=sampling_metadata.
-                _cache_collision_dummy,
-                do_sampling=sampling_metadata.do_sampling,
-                logprobs=sampling_metadata.logprobs,
-            )
-
-        # Decode-only: no multimodal embeddings.
-        input_ids, inputs_embeds = self._get_input_ids_embeds(
-            input_ids, None, None)
-        lora_metadata = self.lora_utils.extract_lora_metadata()
-
-        # Split RNG for sampling (mirrors standard path in _sample_from_logits).
-        if sampling_metadata.do_sampling:
-            self.rng_params_for_sampling, step_rng = jax.random.split(
-                self.rng_params_for_sampling)
-        else:
-            step_rng = self.rng_params_for_sampling
-
-        from tpu_inference.layers.jax.sample.sampling import sample
-
-        with self.maybe_forbid_compile, \
-             set_forward_context(None, self.vllm_config), \
-             self.maybe_get_kv_connector_output(
-                 scheduler_output) as kv_connector_output:
-            kv_caches, next_tokens, expert_indices = single_step_decode(
-                state=self.state_leaves,
-                kv_caches=self.kv_caches,
-                rng=step_rng,
-                input_ids=input_ids,
-                attn_metadata=attn_metadata,
-                input_positions=input_positions,
-                sampling_metadata=sampling_metadata,
-                inputs_embeds=inputs_embeds,
-                lora_metadata=lora_metadata,
-                intermediate_tensors=None,
-                model_fn=getattr(self.model, "step_fn_no_options",
-                                 self.model_fn),
-                compute_logits_fn=self.compute_logits_fn,
-                sample_fn=sample,
-                mesh=self.mesh,
-                layer_name_to_kvcache_index=tuple(
-                    self.layer_name_to_kvcache_index.items()),
-                is_first_rank=self.is_first_rank,
-                is_last_rank=self.is_last_rank,
-            )
-
-        self.kv_caches = kv_caches
-
-        # Extract relevant tokens on the host using logits_indices.
-        # next_tokens has shape (token_batch_size,) — one token per
-        # token-padded position.  logits_indices maps each request to its
-        # relevant position.  We gather next_tokens[logits_indices] to get
-        # one token per request (padded_num_reqs,).
-        next_tokens_cpu = np.asarray(jax.device_get(next_tokens))
-        # logits_indices is a jax array — convert to host.
-        logits_indices_cpu = np.asarray(jax.device_get(logits_indices))
-        # Gather: for each request, pick the token at its logits_index.
-        # Negative indices (-1 = padding) map to the last element, but
-        # those slots are beyond num_reqs and will be skipped below.
-        selected_tokens = next_tokens_cpu[logits_indices_cpu]
-        if logits_indices_selector is not None:
-            selected_tokens = selected_tokens[logits_indices_selector]
-
-        num_reqs = self.input_batch.num_reqs
-        sampled_token_ids = []
-        for req_idx in range(num_reqs):
-            token_id = int(selected_tokens[req_idx])
-            sampled_token_ids.append([token_id])
-
-            # Update input batch state (mirror standard path).
-            req_id = self.input_batch.req_ids[req_idx]
-            req_state = self.requests.get(req_id)
-            if req_state is not None:
-                start_idx = self.input_batch.num_tokens_no_spec[req_idx]
-                end_idx = start_idx + 1
-                if req_idx < self.max_num_reqs and end_idx <= self.max_model_len:
-                    self.input_batch.token_ids_cpu[
-                        req_idx, start_idx:end_idx] = token_id
-                    self.input_batch.num_tokens_no_spec[req_idx] = end_idx
-                    self.input_batch.num_tokens[req_idx] = end_idx
-                    req_state.output_token_ids.append(token_id)
-
-            if hasattr(attn_metadata,
-                       "seq_lens_cpu") and attn_metadata.seq_lens_cpu is not None:
-                attn_metadata.seq_lens_cpu[req_idx] += 1
-
-        # Handle routed experts (MoE).
-        routed_experts = None
-        if (getattr(self.vllm_config.model_config,
-                    "enable_return_routed_experts", False)
-                and expert_indices is not None):
-            expert_indices_cpu = np.asarray(jax.device_get(expert_indices))
-            routed_experts = _reconstruct_routed_experts(
-                runner=self,
-                scheduler_output=scheduler_output,
-                expert_indices_cpu=expert_indices_cpu,
-                req_ids=self.input_batch.req_ids[:num_reqs],
-                req_ids_dp=req_ids_dp,
-                padded_num_scheduled_tokens_per_dp_rank=
-                padded_num_scheduled_tokens_per_dp_rank,
-            )
-
-        output = ModelRunnerOutput(
-            req_ids=self.input_batch.req_ids[:num_reqs],
-            req_id_to_index=self.input_batch.req_id_to_index.copy(),
-            sampled_token_ids=sampled_token_ids,
-            logprobs=None,
-            prompt_logprobs_dict={},
-            pooler_output=[],
-            kv_connector_output=kv_connector_output,
-        )
-
-        if routed_experts is not None:
-            output.routed_experts = routed_experts
-
-        self._continue_decode_output = output
-        return None
+        # Temporarily force max_decode_steps=1 for this single step.
+        # Save and restore the original static_max_decode_steps.
+        original_static_max = self.static_max_decode_steps
+        self.static_max_decode_steps = 1
+        try:
+            return self._execute_continue_decode(scheduler_output)
+        finally:
+            self.static_max_decode_steps = original_static_max
 
     def _sample_from_logits(
         self,
