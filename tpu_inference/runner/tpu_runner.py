@@ -1396,9 +1396,32 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             _,
         ) = self._prepare_inputs(scheduler_output)
 
-        init_tokens = input_ids
+        # For decode-only (continue_decode), each request contributes exactly
+        # 1 token. ``_prepare_inputs`` pads ``input_ids`` and ``positions`` to
+        # ``padded_total_num_scheduled_tokens`` (token padding, min 16), but
+        # ``continue_decode`` and its precompile expect them padded to
+        # ``padded_num_reqs`` (request padding) to match the
+        # ``sampling_metadata`` batch dimension and the precompiled JIT shape.
+        # When the token-padded size exceeds the request-padded size (e.g.,
+        # 8 reqs → token-padded to 16 but request-padded to 8), slice to
+        # ``padded_num_reqs`` to avoid a logits/temperature shape mismatch.
+        init_tokens = input_ids[:padded_num_reqs]
+        decode_positions = input_positions[:padded_num_reqs]
+
+        # Rebuild attn_metadata with the correctly-sized input_positions and
+        # padded_num_reqs (matching the precompile in _precompile_continue_decode
+        # which uses num_reqs from num_reqs_paddings for both fields).
+        decode_attn_metadata = AttentionMetadata(
+            input_positions=decode_positions,
+            block_tables=attn_metadata.block_tables,
+            seq_lens=attn_metadata.seq_lens,
+            query_start_loc=attn_metadata.query_start_loc,
+            request_distribution=attn_metadata.request_distribution,
+            mamba_state_indices=attn_metadata.mamba_state_indices,
+            padded_num_reqs=padded_num_reqs,
+        )
+
         # Map active rows correctly across DP buckets by checking valid query locations.
-        # Pad active_mask to match the full padded_total_num_scheduled_tokens length of init_tokens.
         tokens_per_dp = init_tokens.shape[0] // self.dp_size
         active_mask = _compute_active_mask(logits_indices, self.dp_size,
                                            tokens_per_dp)
@@ -1406,7 +1429,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         init_state = TpuSamplingState(
             current_tokens=init_tokens,
             active_mask=active_mask,
-            attn_metadata=attn_metadata,
+            attn_metadata=decode_attn_metadata,
             step_counter=self.zero_array,
         )
 
