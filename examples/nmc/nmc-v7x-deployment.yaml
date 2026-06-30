@@ -7,6 +7,10 @@
 # GKE auto-taints Flex nodes with google.com/tpu + cloud.google.com/gke-queued.
 # Pods MUST tolerate both taints or the autoscaler won't request capacity.
 #
+# continue_decode: enabled via additional_config JSON ConfigMap mounted at
+# /etc/vllm-config/additional_config.json (vLLM's default path). This fuses
+# N decode steps into one jitted while_loop, eliminating per-step pjit dispatch.
+#
 # Usage:
 #   kubectl apply -f nmc-v7x-deployment.yaml
 #   kubectl rollout status deployment/nmc-v7x-inference
@@ -14,6 +18,19 @@
 #   kubectl exec deployment/nmc-v7x-inference -- curl -s localhost:8000/v1/completions \
 #     -X POST -H "Content-Type: application/json" \
 #     -d '{"model":"CohereLabs/North-Mini-Code-1.0","prompt":"def hello():","max_tokens":32,"temperature":0}'
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nmc-additional-config
+  labels:
+    app: nmc-v7x-inference
+data:
+  additional_config.json: |
+    {
+      "enable_continue_decode": true
+    }
 
 ---
 apiVersion: apps/v1
@@ -80,6 +97,8 @@ spec:
               value: "1"
             - name: VLLM_XLA_CHECK_RECOMPILATION
               value: "0"
+            - name: ATTN_BUCKETIZED_NUM_REQS
+              value: "1"
           ports:
             - containerPort: 8000
           resources:
@@ -92,6 +111,9 @@ spec:
               mountPath: /root/.cache/huggingface
             - name: dshm
               mountPath: /dev/shm
+            - name: additional-config
+              mountPath: /etc/vllm-config
+              readOnly: true
           startupProbe:
             httpGet:
               path: /health
@@ -113,3 +135,6 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 8Gi
+        - name: additional-config
+          configMap:
+            name: nmc-additional-config
