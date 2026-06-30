@@ -145,18 +145,21 @@ class Cohere2Attention(JaxModule):
     # kernel auto-tuned defaults. The mixed kernel handles queries with
     # dynamic q_len (neither pure-decode nor pure-prefill).
     #
-    # Tuned candidate 1 (aggressive): (512, 4096, 256, 1024).
-    # - 2x query fetch (bq_sz=512 vs heuristic 256) → fewer query blocks,
-    #   better MXU utilization for compute-bound long prefill.
-    # - 2x KV fetch (bkv_sz=4096 vs heuristic 2048) → single KV pass for
-    #   4096-token prefill (eliminates outer KV loop overhead).
-    # - 2x compute chunks (bq_csz=256, bkv_csz=1024) → 4x larger matmuls
-    #   (256x1024x128 vs 128x512x128) → better MXU pipeline fill.
-    # Roofline: at q_len=4096, AI≈2048 FLOPs/byte → compute-bound → larger
-    # matmuls help. At q_len=128, AI≈64 → memory-bound → larger bkv_sz helps
-    # HBM bandwidth.
-    mixed_block_sizes: Optional[Tuple[int, int, int, int]] = (512, 4096, 256,
-                                                               1024)
+    # Tuned via 23-config sweep on TPU v7x (TP=4, q_heads=8, kv_heads=1,
+    # head_dim=128, page_size=256). Best config: (512, 2048, 256, 512) —
+    # 1.15x kernel speedup at L=4096 vs heuristic default (256, 2048, 128,
+    # 512). The 2x query fetch (bq_sz=512) and 2x query compute chunk
+    # (bq_csz=256) improve MXU utilization; KV dimensions stay at heuristic
+    # values (lower VMEM risk than the aggressive 4096/1024 variant).
+    #
+    # NOTE: kernel-level tuning has marginal end-to-end impact. At L=4096,
+    # the RPA kernel is ~0.3% of prefill TTFT (0.5ms kernel vs 151ms TTFT).
+    # The 5.15x prefill gap vs H200 is dominated by Python dispatch + JAX
+    # runtime overhead (~5ms/step), not kernel execution. This config is
+    # committed as a minor optimization; the real prefill lever is reducing
+    # per-step dispatch overhead (async_scheduling, Pathways).
+    mixed_block_sizes: Optional[Tuple[int, int, int, int]] = (512, 2048, 256,
+                                                               512)
 
     # Prefill-case block sizes (bq_sz, bkv_sz, bq_csz, bkv_csz) or None for
     # kernel auto-tuned defaults. Only used when ``prefill_chunk_size`` is
