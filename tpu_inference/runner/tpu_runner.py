@@ -1640,11 +1640,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
     ) -> None:
         """Execute a single decode step with all 4 dispatches fused into 1 jit.
 
-        Unlike ``continue_decode`` (which wraps N steps in a while_loop and
-        computes logits for ALL token-padded slots), this fuses model +
-        select + logits + sample into a single jitted dispatch with NO
-        while_loop and keeps ``_select_from_array`` inlined to avoid the
-        logits-padding issue.  Eliminates ~3-15 ms/step of per-dispatch XLA
+        Unlike ``continue_decode`` (which wraps N steps in a while_loop),
+        this fuses model + logits + sample into a single jitted dispatch
+        with NO while_loop.  Follows continue_decode's proven pattern:
+        compute logits for ALL token-padded positions and sample for ALL
+        positions (with sampling_metadata padded to token_batch_size).
+        The relevant tokens are extracted on the host using
+        ``logits_indices``.  Eliminates ~3-15 ms/step of per-dispatch XLA
         runtime overhead.
         """
         (
@@ -1659,6 +1661,35 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             req_ids_dp,
             padded_num_scheduled_tokens_per_dp_rank,
         ) = self._prepare_inputs(scheduler_output)
+
+        token_batch_size = input_ids.shape[0]
+
+        # Pad sampling_metadata to token_batch_size (same as continue_decode).
+        # The fused jit computes logits + samples for ALL token-padded
+        # positions, so sampling_metadata must match.  Padding slots use
+        # default sampling params and their sampled tokens are discarded
+        # on the host via logits_indices extraction.
+        if (sampling_metadata.temperature is not None
+                and token_batch_size != padded_num_reqs):
+            _pad_len = token_batch_size - padded_num_reqs
+            _pad_temp = jnp.full((_pad_len, ), 1.0,
+                                 dtype=sampling_metadata.temperature.dtype)
+            _pad_topk = jnp.zeros((_pad_len, ),
+                                  dtype=sampling_metadata.top_k.dtype)
+            _pad_topp = jnp.ones((_pad_len, ),
+                                 dtype=sampling_metadata.top_p.dtype)
+            sampling_metadata = TPUSupportedSamplingMetadata(
+                temperature=jnp.concatenate(
+                    [sampling_metadata.temperature, _pad_temp]),
+                top_k=jnp.concatenate(
+                    [sampling_metadata.top_k, _pad_topk]),
+                top_p=jnp.concatenate(
+                    [sampling_metadata.top_p, _pad_topp]),
+                _cache_collision_dummy=sampling_metadata.
+                _cache_collision_dummy,
+                do_sampling=sampling_metadata.do_sampling,
+                logprobs=sampling_metadata.logprobs,
+            )
 
         # Decode-only: no multimodal embeddings.
         input_ids, inputs_embeds = self._get_input_ids_embeds(
@@ -1685,7 +1716,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 input_ids=input_ids,
                 attn_metadata=attn_metadata,
                 input_positions=input_positions,
-                logits_indices=logits_indices,
                 sampling_metadata=sampling_metadata,
                 inputs_embeds=inputs_embeds,
                 lora_metadata=lora_metadata,
@@ -1703,15 +1733,25 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         self.kv_caches = kv_caches
 
-        # Transfer next_tokens to host and realign to request order.
+        # Extract relevant tokens on the host using logits_indices.
+        # next_tokens has shape (token_batch_size,) — one token per
+        # token-padded position.  logits_indices maps each request to its
+        # relevant position.  We gather next_tokens[logits_indices] to get
+        # one token per request (padded_num_reqs,).
         next_tokens_cpu = np.asarray(jax.device_get(next_tokens))
+        # logits_indices is a jax array — convert to host.
+        logits_indices_cpu = np.asarray(jax.device_get(logits_indices))
+        # Gather: for each request, pick the token at its logits_index.
+        # Negative indices (-1 = padding) map to the last element, but
+        # those slots are beyond num_reqs and will be skipped below.
+        selected_tokens = next_tokens_cpu[logits_indices_cpu]
         if logits_indices_selector is not None:
-            next_tokens_cpu = next_tokens_cpu[logits_indices_selector]
+            selected_tokens = selected_tokens[logits_indices_selector]
 
         num_reqs = self.input_batch.num_reqs
         sampled_token_ids = []
         for req_idx in range(num_reqs):
-            token_id = int(next_tokens_cpu[req_idx])
+            token_id = int(selected_tokens[req_idx])
             sampled_token_ids.append([token_id])
 
             # Update input batch state (mirror standard path).

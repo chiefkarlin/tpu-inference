@@ -1810,8 +1810,6 @@ class CompilationManager:
             input_positions = self._create_dummy_tensor((num_reqs, ),
                                                          jnp.int32,
                                                          dp_sharding)
-            logits_indices = self._create_dummy_tensor((num_reqs, ),
-                                                       jnp.int32, dp_sharding)
 
             seq_lens = self._create_dummy_tensor(
                 (self.runner.max_num_reqs, ), jnp.int32, dp_sharding)
@@ -1888,7 +1886,6 @@ class CompilationManager:
                 input_ids,
                 attn_metadata,
                 input_positions,
-                logits_indices,
                 sampling_metadata,
                 inputs_embeds,
                 lora_metadata,
@@ -1905,7 +1902,6 @@ class CompilationManager:
                         input_ids=input_ids,
                         attn_metadata=attn_metadata,
                         input_positions=input_positions,
-                        logits_indices=logits_indices,
                         sampling_metadata=sampling_metadata,
                         inputs_embeds=inputs_embeds,
                         lora_metadata=lora_metadata,
@@ -1943,7 +1939,6 @@ class CompilationManager:
                 init_tokens,
                 attn_metadata,
                 input_positions,
-                logits_indices,
                 sampling_metadata,
                 None,  # inputs_embeds
                 lora_metadata,

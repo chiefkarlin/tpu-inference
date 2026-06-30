@@ -146,9 +146,10 @@ class TestSingleStepDecodeFunction(unittest.TestCase):
                       "single_step_decode must call sample_fn")
 
     def test_inlined_select_not_separate_dispatch(self):
-        """The select must be inlined as hidden_states[logits_indices],
-        NOT a call to _select_from_array_fn (which would be a separate
-        dispatch)."""
+        """The select must NOT happen inside the fused jit — no
+        _select_from_array_fn call and no logits_indices indexing.
+        Token extraction happens on the HOST after device_get (like
+        continue_decode's proven approach)."""
         func = _find_func(self.tree, "single_step_decode")
         self.assertIsNotNone(func)
         # Check only the body (skip docstring) for _select_from_array calls.
@@ -161,12 +162,12 @@ class TestSingleStepDecodeFunction(unittest.TestCase):
                 name = _call_func_name(node)
                 self.assertNotEqual(
                     name, "_select_from_array_fn",
-                    "single_step_decode must NOT call _select_from_array_fn "
-                    "— the select is inlined as hidden_states[logits_indices]")
-        # Verify logits_indices is used (inlined gather).
+                    "single_step_decode must NOT call _select_from_array_fn")
+        # logits_indices must NOT be a parameter (select is on host).
         body_src = ast.unparse(ast.Module(body=body, type_ignores=[]))
-        self.assertIn("logits_indices", body_src,
-                      "logits_indices must be used in the function body")
+        self.assertNotIn("logits_indices", body_src,
+                         "logits_indices must NOT be used inside the fused "
+                         "jit — token extraction happens on the host")
 
     def test_no_while_loop(self):
         """Unlike _decode_core, single_step_decode must NOT use a

@@ -277,7 +277,6 @@ def single_step_decode(
     input_ids,
     attn_metadata,
     input_positions,
-    logits_indices,
     sampling_metadata,
     inputs_embeds,
     lora_metadata,
@@ -290,24 +289,23 @@ def single_step_decode(
     is_first_rank,
     is_last_rank,
 ):
-    """Single-step fused decode: model + select + logits + sample in one jit.
+    """Single-step fused decode: model + logits + sample in one jit.
 
     Fuses the 4 separate XLA dispatches of the standard decode path into a
     single jitted function to eliminate per-dispatch runtime overhead
     (~1-5 ms each).  Unlike ``continue_decode``, this does NOT use a
-    while_loop and keeps ``_select_from_array`` inlined to avoid the
-    logits-padding issue that hurt continue_decode throughput.
+    while_loop.
 
-    The select is done on LOGITS (after compute_logits) rather than on
-    hidden_states (before compute_logits).  This avoids GSPMD dynamic
-    indexing issues with hidden_states (which has complex sharding
-    interactions between ATTN_DATA and MODEL axes inside the fused jit).
-    Logits have a simpler sharding (MLP_DATA on the token dimension) and
-    the select produces the correct padded_num_reqs rows to match
-    sampling_metadata.  The overhead of computing logits for a few extra
-    padding rows is negligible (lm_head is a small fraction of step time).
+    Follows continue_decode's PROVEN pattern: compute logits for ALL token
+    positions and sample for ALL positions (with sampling_metadata padded
+    to token_batch_size).  No ``logits_indices`` select inside the fused
+    jit — the relevant tokens are extracted on the HOST after
+    ``device_get``.  This avoids GSPMD dynamic-indexing issues that
+    produced garbled output when selecting inside the fused jit.
 
-    Returns ``(kv_caches, next_tokens, expert_indices)``.
+    Returns ``(kv_caches, next_tokens, expert_indices)`` where
+    ``next_tokens`` has shape ``(token_batch_size,)`` (ALL positions,
+    including padding — host extracts the relevant ones).
     """
     # 1. Forward pass (dispatch 1 fused)
     kv_caches, hidden_states, _, expert_indices = model_fn(
@@ -324,17 +322,12 @@ def single_step_decode(
         is_last_rank,
     )
     # 2. Compute logits for ALL token positions (dispatch 3 fused).
-    #    Like continue_decode, compute logits before selecting. This avoids
-    #    GSPMD dynamic-indexing issues with hidden_states (sharded on
-    #    ATTN_DATA) inside the fused jit.
+    #    No select inside the fused jit — sample for ALL positions, extract
+    #    on host.  This mirrors continue_decode's proven approach.
     logits = compute_logits_fn(state, hidden_states, None)
     logits = logits.astype(jnp.float32)
-    # 3. Select logits for relevant positions (dispatch 2 fused).
-    #    Gathers the last-token logits per request, reducing from
-    #    padded_total_num_scheduled_tokens to padded_num_reqs rows so that
-    #    logits match sampling_metadata (also padded_num_reqs).
-    logits = logits[logits_indices]
-    # 4. Sample (dispatch 4 fused)
+    # 3. Sample for ALL positions (dispatch 4 fused).
+    #    sampling_metadata is padded to token_batch_size by the caller.
     next_tokens, _ = sample_fn(rng, mesh, logits, sampling_metadata)
     return kv_caches, next_tokens, expert_indices
 
