@@ -536,6 +536,89 @@ class TestCohere2AttentionWiring(unittest.TestCase):
                         found = True
         self.assertTrue(found, "d_block_sizes must be passed to the kernel")
 
+    def test_m_block_sizes_passed_to_kernel(self):
+        """m_block_sizes kwarg must reach ragged_paged_attention (Phase 2)."""
+        attn_cls = _find_class(self.tree, "Cohere2Attention")
+        method = _find_method(attn_cls, "attention")
+        found = False
+        for node in ast.walk(method):
+            if isinstance(node, ast.Call) and _call_func_name(
+                    node) == "ragged_paged_attention":
+                for kw in node.keywords:
+                    if kw.arg == "m_block_sizes":
+                        found = True
+        self.assertTrue(
+            found, "m_block_sizes must be passed to the kernel (Phase 2)")
+
+    def test_p_block_sizes_passed_to_kernel(self):
+        """p_block_sizes kwarg must reach ragged_paged_attention (Phase 2)."""
+        attn_cls = _find_class(self.tree, "Cohere2Attention")
+        method = _find_method(attn_cls, "attention")
+        found = False
+        for node in ast.walk(method):
+            if isinstance(node, ast.Call) and _call_func_name(
+                    node) == "ragged_paged_attention":
+                for kw in node.keywords:
+                    if kw.arg == "p_block_sizes":
+                        found = True
+        self.assertTrue(
+            found, "p_block_sizes must be passed to the kernel (Phase 2)")
+
+    def test_chunk_prefill_size_passed_to_kernel(self):
+        """chunk_prefill_size kwarg must reach ragged_paged_attention (Phase 2).
+
+        This enables the dedicated PREFILL kernel launch (static q_len),
+        which XLA optimizes more aggressively than the dynamic MIXED path.
+        """
+        attn_cls = _find_class(self.tree, "Cohere2Attention")
+        method = _find_method(attn_cls, "attention")
+        found = False
+        for node in ast.walk(method):
+            if isinstance(node, ast.Call) and _call_func_name(
+                    node) == "ragged_paged_attention":
+                for kw in node.keywords:
+                    if kw.arg == "chunk_prefill_size":
+                        found = True
+        self.assertTrue(
+            found,
+            "chunk_prefill_size must be passed to the kernel (Phase 2: "
+            "enables dedicated PREFILL launch)")
+
+    def test_prefill_chunk_size_default_4096(self):
+        """prefill_chunk_size field must default to 4096 (NMC sliding_window)."""
+        attn_cls = _find_class(self.tree, "Cohere2Attention")
+        src = ast.unparse(attn_cls)
+        self.assertIn("prefill_chunk_size", src,
+                      "prefill_chunk_size field must exist (Phase 2)")
+        # The default value must be 4096 (NMC's sliding_window).
+        found_4096_default = False
+        for node in ast.walk(attn_cls):
+            if isinstance(node, ast.AnnAssign):
+                if (node.target and isinstance(node.target, ast.Name)
+                        and node.target.id == "prefill_chunk_size"
+                        and node.value is not None
+                        and isinstance(node.value, ast.Constant)
+                        and node.value.value == 4096):
+                    found_4096_default = True
+        self.assertTrue(
+            found_4096_default,
+            "prefill_chunk_size must default to 4096 (NMC sliding_window)")
+
+    def test_mixed_and_prefill_block_sizes_fields_exist(self):
+        """mixed_block_sizes and prefill_block_sizes fields must exist (Phase 2)."""
+        attn_cls = _find_class(self.tree, "Cohere2Attention")
+        field_names = set()
+        for node in ast.walk(attn_cls):
+            if isinstance(node, ast.AnnAssign) and isinstance(
+                    node.target, ast.Name):
+                field_names.add(node.target.id)
+        self.assertIn(
+            "mixed_block_sizes", field_names,
+            "mixed_block_sizes field must exist (Phase 2)")
+        self.assertIn(
+            "prefill_block_sizes", field_names,
+            "prefill_block_sizes field must exist (Phase 2)")
+
     def test_rope_interleaved_default(self):
         """rope_input_ordering default must be 'interleaved'."""
         attn_cls = _find_class(self.tree, "Cohere2Attention")
