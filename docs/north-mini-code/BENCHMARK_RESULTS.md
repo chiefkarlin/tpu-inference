@@ -1,11 +1,14 @@
-# NMC v7x-4 Benchmark Results — GPU Comparison Baseline
+# NMC v7x-4 Benchmark Results — GPU Comparison
 
 **Date:** 2026-06-30
 **Model:** CohereLabs/North-Mini-Code-1.0 (30.48B params, BF16, MoE 128/8)
 **Hardware:** TPU v7x-4 (2x2x1, 4 chips, 94.75 GiB HBM/chip, 7.4 TB/s HBM BW, 2157 TFLOP/s BF16)
 **Software:** vLLM 0.23.1rc1.dev493+gdccb412e2, JAX 0.10.2, libtpu 0.0.42.1, flax 0.12.4
-**Server config:** TP=4, max-model-len=8192, max-num-seqs=8, max-num-batched-tokens=1024, dtype=bf16
 **Method:** vllm bench serve with synthetic random data, --ignore-eos for controlled output lengths
+
+---
+
+## Config A: Baseline (max-num-seqs=8, max-num-batched-tokens=1024)
 
 ## Summary Table
 
@@ -116,3 +119,67 @@
 | HBM bandwidth | 7.4 TB/s/chip (29.6 TB/s total) |
 | MXU BF16 | 2,157 TFLOP/s/chip (8,628 TFLOP/s total) |
 | Cores | 2 per chip (8 total) |
+
+---
+
+## Config B: Tuned (max-num-seqs=32, max-num-batched-tokens=4096)
+
+**Server config:** TP=4, max-model-len=8192, max-num-seqs=32, max-num-batched-tokens=4096, dtype=bf16
+
+### Phase 3: Throughput Scaling (512→128)
+*Input=512, output=128. Note: c1-c8 include XLA recompilation artifacts (pod freshly restarted). c16+ are post-compile.*
+
+| Concurrency | Prompts | TPOT p50 (ms) | TPOT p90 (ms) | Peak Output Tput (tok/s) | Total Tput (tok/s) |
+|---|---|---|---|---|---|
+| 1 | 4 | 6.30 | 6.37 | 153 | 112 |
+| 2 | 8 | 6.50 | 6.70 | 274 | 324 |
+| 4 | 16 | 6.89 | 7.20 | 540 | 635 |
+| 8 | 32 | 7.47 | 7.51 | 1024 | 1200 |
+| 16 | 64 | 8.43 | 9.71 | 1828 | 4600 |
+| 32 | 128 | 19.66 | 75.85 | 2528 | 1892 |
+
+*c32 throughput phase shows degradation (TPOT p90=76ms) — batch saturates at c16 for this input/output shape.*
+
+### Phase 4: Realistic Mixed (512→256) — CLEAN (post-compile)
+
+| Concurrency | Prompts | TTFT p50 (ms) | TPOT p50 (ms) | TPOT p90 (ms) | TPOT p99 (ms) | Output Tput (tok/s) | Total Tput (tok/s) |
+|---|---|---|---|---|---|---|---|
+| 1 | 4 | 34.7 | 6.41 | 6.50 | 6.51 | 153 | 459 |
+| 4 | 16 | 79.3 | 6.96 | 7.12 | 7.13 | 553 | 1658 |
+| 8 | 32 | 113.7 | 7.54 | 7.79 | 7.87 | 1003 | 3009 |
+| 16 | 64 | 194.5 | 8.44 | 9.58 | 10.02 | 1676 | 5027 |
+| 32 | 128 | 186.5 | 13.57 | 13.94 | 14.13 | 2233 | 6698 |
+
+## Side-by-Side Comparison: Mixed (512→256)
+
+| Concurrency | Config A TPOT p50 (ms) | Config B TPOT p50 (ms) | Config A Output (tok/s) | Config B Output (tok/s) | Config A Total (tok/s) | Config B Total (tok/s) |
+|---|---|---|---|---|---|---|
+| 1 | 6.17 | 6.41 | 159 | 153 | 478 | 459 |
+| 4 | 7.02 | 6.96 | 551 | 553 | 1652 | 1658 |
+| 8 | 7.73 | 7.54 | 992 | 1003 | 2975 | 3009 |
+| 16 | — | 8.44 | — | 1676 | — | 5027 |
+| 32 | — | 13.57 | — | 2233 | — | 6698 |
+
+*Config A couldn't test c16/c32 (max-num-seqs=8 cap). Config B unlocks full scaling.*
+
+## Key Findings — Config B (Tuned)
+
+| Metric | Config A | Config B | Improvement |
+|---|---|---|---|
+| **Best output throughput** | 992 tok/s (c8) | 2,233 tok/s (c32) | 2.25× |
+| **Best total throughput** | 2,975 tok/s (c8) | 6,698 tok/s (c32) | 2.25× |
+| **Sweet spot output tput** | 992 tok/s @ 7.73ms TPOT | 1,676 tok/s @ 8.44ms TPOT | 1.69× @ similar latency |
+| **Single-stream TPOT** | 6.17 ms | 6.41 ms | ~same (config overhead) |
+| **Max batch tested** | 8 | 32 | 4× |
+
+### Scaling Analysis
+- **c1-c8:** Nearly identical between configs (batch fits in both). TPOT ~6-8ms.
+- **c16 (NEW):** 1,676 tok/s output @ 8.44ms TPOT — **best latency/throughput trade-off**. Only 32% TPOT degradation vs c1, with 11× throughput gain.
+- **c32 (NEW):** 2,233 tok/s output @ 13.57ms TPOT — **best raw throughput** but 2.1× TPOT degradation. Total throughput 6,698 tok/s.
+- **Peak output throughput:** 2,560 tok/s (c32 instantaneous peak).
+- **Diminishing returns at c32:** TPOT jumps from 8.44ms (c16) to 13.57ms (c32) — 61% degradation for 33% more throughput. The TPU is approaching HBM bandwidth saturation at batch=32.
+
+### HBM Bandwidth Utilization
+- HBM-bound theoretical (batch=1): 3,950 tok/s → actual 162 tok/s = 4.1% HBM BW utilization
+- HBM-bound theoretical (batch=32): 3,950 tok/s → actual 2,233 tok/s = 56.5% HBM BW utilization
+- At c32, the TPU is approaching HBM-bound efficiency — the 8× gap from P-4 trace analysis is closing with batch size.

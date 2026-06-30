@@ -149,8 +149,8 @@ def main():
         print("\n" + "="*70)
         print("PHASE 3: THROUGHPUT SCALING")
         print("="*70)
-        # max_num_seqs=8 on current config, so test 1,2,4,8
-        for concurrency in [1, 2, 4, 8]:
+        # Test full scaling range: 1,2,4,8,16,32
+        for concurrency in [1, 2, 4, 8, 16, 32]:
             r = run_bench(
                 args.base_url, args.model, "random",
                 input_len=512, output_len=128,
@@ -167,7 +167,7 @@ def main():
         print("\n" + "="*70)
         print("PHASE 4: REALISTIC MIXED (512/256, concurrency sweep)")
         print("="*70)
-        for concurrency in [1, 4, 8]:
+        for concurrency in [1, 4, 8, 16, 32]:
             r = run_bench(
                 args.base_url, args.model, "random",
                 input_len=512, output_len=256,
