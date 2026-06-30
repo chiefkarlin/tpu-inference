@@ -260,13 +260,17 @@ class TestTpuRunnerWiring(unittest.TestCase):
     def test_stashes_in_continue_decode_output(self):
         """_execute_single_step_decode must stash output in
         self._continue_decode_output (so sample_tokens bypasses
-        _sample_from_logits)."""
+        _sample_from_logits).  This can be done directly OR via
+        delegation to _execute_continue_decode (which sets it internally)."""
         cls_node = _find_class(self.tree, "TPUModelRunner")
         method = _find_method(cls_node, "_execute_single_step_decode")
         self.assertIsNotNone(method)
         src = ast.unparse(method)
-        self.assertIn("_continue_decode_output", src,
-                      "must stash output in _continue_decode_output")
+        self.assertTrue(
+            "_continue_decode_output" in src
+            or "_execute_continue_decode" in src,
+            "must either stash in _continue_decode_output directly or "
+            "delegate to _execute_continue_decode (which sets it internally)")
 
 
 class TestCompilationManagerPrecompile(unittest.TestCase):
