@@ -143,9 +143,20 @@ class Cohere2Attention(JaxModule):
 
     # Mixed-case block sizes (bq_sz, bkv_sz, bq_csz, bkv_csz) or None for
     # kernel auto-tuned defaults. The mixed kernel handles queries with
-    # dynamic q_len (neither pure-decode nor pure-prefill). None lets
-    # ``get_default_block_sizes`` pick heuristics based on the runtime shapes.
-    mixed_block_sizes: Optional[Tuple[int, int, int, int]] = None
+    # dynamic q_len (neither pure-decode nor pure-prefill).
+    #
+    # Tuned candidate 1 (aggressive): (512, 4096, 256, 1024).
+    # - 2x query fetch (bq_sz=512 vs heuristic 256) → fewer query blocks,
+    #   better MXU utilization for compute-bound long prefill.
+    # - 2x KV fetch (bkv_sz=4096 vs heuristic 2048) → single KV pass for
+    #   4096-token prefill (eliminates outer KV loop overhead).
+    # - 2x compute chunks (bq_csz=256, bkv_csz=1024) → 4x larger matmuls
+    #   (256x1024x128 vs 128x512x128) → better MXU pipeline fill.
+    # Roofline: at q_len=4096, AI≈2048 FLOPs/byte → compute-bound → larger
+    # matmuls help. At q_len=128, AI≈64 → memory-bound → larger bkv_sz helps
+    # HBM bandwidth.
+    mixed_block_sizes: Optional[Tuple[int, int, int, int]] = (512, 4096, 256,
+                                                               1024)
 
     # Prefill-case block sizes (bq_sz, bkv_sz, bq_csz, bkv_csz) or None for
     # kernel auto-tuned defaults. Only used when ``prefill_chunk_size`` is
