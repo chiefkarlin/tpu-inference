@@ -1397,6 +1397,44 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         ) = self._prepare_inputs(scheduler_output)
 
         init_tokens = input_ids
+        token_batch_size = init_tokens.shape[0]
+
+        # For decode-only (continue_decode), ``_prepare_inputs`` pads
+        # ``input_ids`` to ``padded_total_num_scheduled_tokens`` (token padding,
+        # min 16) but ``sampling_metadata`` to ``padded_num_reqs`` (request
+        # padding, can be < 16). The continue_decode loop (decode_loop.py)
+        # computes logits for ALL tokens in ``current_tokens`` and passes them
+        # directly to ``sample_fn`` — unlike the standard path which uses
+        # ``logits_indices`` to select relevant hidden states before computing
+        # logits. When token-padded > request-padded (e.g., 16 > 8), the
+        # logits/temperature shape mismatch crashes at sampling.py:88.
+        #
+        # Fix: pad sampling_metadata (temperature, top_k, top_p) to the
+        # token-padded batch size. Padding slots use default sampling params
+        # (temperature=1.0, top_k=0, top_p=1.0) and are masked out by
+        # ``active_mask`` in the decode loop, so their sampled tokens are
+        # discarded (``next_input_ids = where(active_mask, next_tokens, pad)``).
+        if (sampling_metadata.temperature is not None
+                and token_batch_size != padded_num_reqs):
+            _pad_len = token_batch_size - padded_num_reqs
+            _pad_temp = jnp.full((_pad_len, ), 1.0,
+                                 dtype=sampling_metadata.temperature.dtype)
+            _pad_topk = jnp.zeros((_pad_len, ),
+                                  dtype=sampling_metadata.top_k.dtype)
+            _pad_topp = jnp.ones((_pad_len, ),
+                                 dtype=sampling_metadata.top_p.dtype)
+            sampling_metadata = TPUSupportedSamplingMetadata(
+                temperature=jnp.concatenate(
+                    [sampling_metadata.temperature, _pad_temp]),
+                top_k=jnp.concatenate(
+                    [sampling_metadata.top_k, _pad_topk]),
+                top_p=jnp.concatenate(
+                    [sampling_metadata.top_p, _pad_topp]),
+                _cache_collision_dummy=sampling_metadata._cache_collision_dummy,
+                do_sampling=sampling_metadata.do_sampling,
+                logprobs=sampling_metadata.logprobs,
+            )
+
         # Map active rows correctly across DP buckets by checking valid query locations.
         # Pad active_mask to match the full padded_total_num_scheduled_tokens length of init_tokens.
         tokens_per_dp = init_tokens.shape[0] // self.dp_size

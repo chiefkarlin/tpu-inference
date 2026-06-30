@@ -94,6 +94,13 @@ class Cohere2Attention(JaxModule):
     keeping every element a multiple of the page size. Leave ``None`` to
     use the kernel defaults. Tuple order is ``(bq_sz, bkv_sz, bq_csz,
     bkv_csz)``; see ``ragged_paged_attention`` validation.
+
+    Prefill tuning: ``prefill_chunk_size`` (default 4096 = NMC
+    ``sliding_window``) enables the dedicated PREFILL kernel launch with a
+    static ``q_len``, which XLA optimizes more aggressively than the
+    dynamic MIXED path. ``mixed_block_sizes`` and ``prefill_block_sizes``
+    default to ``None`` (kernel auto-tuned via ``get_default_block_sizes``);
+    override with explicit tuples to sweep.
     """
 
     # Core configuration
@@ -133,6 +140,27 @@ class Cohere2Attention(JaxModule):
     # compute passes (bkv_csz=2048) — halves the double-buffered KV footprint.
     decode_block_sizes: Optional[Tuple[int, int, int, int]] = (1, 4096, 1,
                                                                2048)
+
+    # Mixed-case block sizes (bq_sz, bkv_sz, bq_csz, bkv_csz) or None for
+    # kernel auto-tuned defaults. The mixed kernel handles queries with
+    # dynamic q_len (neither pure-decode nor pure-prefill). None lets
+    # ``get_default_block_sizes`` pick heuristics based on the runtime shapes.
+    mixed_block_sizes: Optional[Tuple[int, int, int, int]] = None
+
+    # Prefill-case block sizes (bq_sz, bkv_sz, bq_csz, bkv_csz) or None for
+    # kernel auto-tuned defaults. Only used when ``prefill_chunk_size`` is
+    # set (enabling the dedicated PREFILL launch with a static q_len).
+    prefill_block_sizes: Optional[Tuple[int, int, int, int]] = None
+
+    # Chunk size for the dedicated PREFILL kernel launch. When set (non-None),
+    # the RPA v3 dispatch runs a prefill-specific kernel with
+    # ``static_q_len=chunk_prefill_size`` in addition to the decode and mixed
+    # kernels. The static q_len enables XLA to optimize the prefill path more
+    # aggressively than the dynamic mixed path. Set to NMC's ``sliding_window``
+    # (4096) so a full sliding-window prefill is one launch. Set to ``None``
+    # to disable the dedicated prefill path (all prefill falls through to the
+    # mixed kernel).
+    prefill_chunk_size: Optional[int] = None
 
     # Quantization scales (per-tensor; 1.0 when unquantized)
     _q_scale: float = 1.0
@@ -283,8 +311,11 @@ class Cohere2Attention(JaxModule):
 
         Mirrors the base ``Attention.attention()`` implementation but adds
         ``sliding_window`` (read via :func:`getattr` with a ``None`` default
-        so full-attention layers fall back to unwindowed attention) and
-        ``d_block_sizes`` to the kernel call.
+        so full-attention layers fall back to unwindowed attention) and the
+        full set of v3 block-size / prefill-chunk tuning kwargs to the kernel
+        call: ``d_block_sizes`` (decode), ``m_block_sizes`` (mixed),
+        ``p_block_sizes`` (prefill), and ``chunk_prefill_size`` (enables the
+        dedicated PREFILL launch with a static ``q_len``).
         """
         md = attention_metadata
         sliding_window = getattr(md, "sliding_window", None)
@@ -312,6 +343,9 @@ class Cohere2Attention(JaxModule):
                 k_scale=k_scale,
                 v_scale=v_scale,
                 d_block_sizes=self.decode_block_sizes,
+                m_block_sizes=self.mixed_block_sizes,
+                p_block_sizes=self.prefill_block_sizes,
+                chunk_prefill_size=self.prefill_chunk_size,
             )
 
         output_TNH, kv_cache = jax.jit(

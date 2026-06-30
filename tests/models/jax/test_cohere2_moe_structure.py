@@ -310,6 +310,98 @@ class TestMoEConfig(unittest.TestCase):
                       "expert intermediate must be config.intermediate_size")
 
 
+class TestExpertParallelismConfig(unittest.TestCase):
+    """Verify Phase 3 expert-parallelism sharding + mutual-exclusion guard."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tree = _parse(_COHERE2_MOE_PATH)
+
+    def test_expert_axis_name_is_expert(self):
+        """expert_axis_name must be ShardingAxisName.EXPERT (Phase 3)."""
+        moe_block_cls = _find_class(self.tree, "Cohere2MoeSparseMoeBlock")
+        init_method = _find_method(moe_block_cls, "__init__")
+        src = ast.unparse(init_method)
+        self.assertIn("ShardingAxisName.EXPERT", src,
+                      "expert_axis_name must be ShardingAxisName.EXPERT")
+
+    def test_mutual_exclusion_guard_present(self):
+        """The mutual-exclusion guard from deepseek_v3.py:1144 must be present.
+
+        EP is only activated when total_tensor_parallelism == 1 (TP is 1,
+        attention runs in DP mode). Without this, EP sharding would conflict
+        with TP and crash.
+        """
+        moe_block_cls = _find_class(self.tree, "Cohere2MoeSparseMoeBlock")
+        init_method = _find_method(moe_block_cls, "__init__")
+        src = ast.unparse(init_method)
+        self.assertIn("total_tensor_parallelism", src,
+                      "mutual-exclusion guard must compute total_tensor_parallelism")
+        self.assertIn("tp_size", src,
+                      "guard must use sharding_config.tp_size")
+        self.assertIn("attn_dp_size", src,
+                      "guard must use sharding_config.attn_dp_size")
+        self.assertIn("total_tensor_parallelism == 1", src,
+                      "guard must check total_tensor_parallelism == 1")
+
+    def test_conditional_sharding_ep_vs_tp(self):
+        """Sharding must be conditional: EP shards experts, TP replicates.
+
+        Deepseek_v3 (L888-902) makes edf/efd_sharding conditional on the
+        backend. NMC must do the same: when use_ep=True, shard on EXPERT
+        axis; when use_ep=False, replicate (None,None,None) for GMM_TP.
+        """
+        moe_block_cls = _find_class(self.tree, "Cohere2MoeSparseMoeBlock")
+        init_method = _find_method(moe_block_cls, "__init__")
+        src = ast.unparse(init_method)
+        # The if use_ep / else branching must exist.
+        self.assertIn("if use_ep:", src,
+                      "sharding must branch on use_ep")
+        # EP branch: edf_sharding = P(ShardingAxisName.EXPERT, None, None)
+        self.assertRegex(
+            src,
+            r'edf_sharding\s*=\s*P\(\s*ShardingAxisName\.EXPERT\s*,\s*None'
+            r'\s*,\s*None\s*\)',
+            "EP branch must set edf_sharding=P(EXPERT, None, None)")
+        # TP branch: edf_sharding = P(None, None, None)
+        self.assertRegex(
+            src,
+            r'edf_sharding\s*=\s*P\(\s*None\s*,\s*None\s*,\s*None\s*\)',
+            "TP branch must set edf_sharding=P(None, None, None)")
+
+    def test_edf_sharding_not_hardcoded_p_none(self):
+        """edf_sharding must NOT be hardcoded P(None,) — must be conditional
+        (Phase 3 regression guard)."""
+        moe_block_cls = _find_class(self.tree, "Cohere2MoeSparseMoeBlock")
+        init_method = _find_method(moe_block_cls, "__init__")
+        for node in ast.walk(init_method):
+            if isinstance(node, ast.Call) and _call_func_name(
+                    node) == "JaxMoE":
+                for kw in node.keywords:
+                    if kw.arg == "edf_sharding":
+                        val_src = ast.unparse(kw.value)
+                        self.assertNotEqual(
+                            val_src, "P(None)",
+                            "edf_sharding must not be hardcoded P(None) — "
+                            "must be the conditional variable (Phase 3)")
+                        return
+        self.fail("JaxMoE edf_sharding kwarg not found")
+
+    def test_moe_backend_passed_to_jaxmoe(self):
+        """moe_backend must be passed to JaxMoE (selects GMM_TP vs GMM_EP)."""
+        moe_block_cls = _find_class(self.tree, "Cohere2MoeSparseMoeBlock")
+        init_method = _find_method(moe_block_cls, "__init__")
+        found = False
+        for node in ast.walk(init_method):
+            if isinstance(node, ast.Call) and _call_func_name(
+                    node) == "JaxMoE":
+                for kw in node.keywords:
+                    if kw.arg == "moe_backend":
+                        found = True
+        self.assertTrue(
+            found, "moe_backend must be passed to JaxMoE (Phase 3)")
+
+
 class TestDenseLayer0Intermediate(unittest.TestCase):
     """REGRESSION: the dense layer 0 must use prefix_dense_intermediate_size.
 
@@ -535,6 +627,90 @@ class TestCohere2AttentionWiring(unittest.TestCase):
                     if kw.arg == "d_block_sizes":
                         found = True
         self.assertTrue(found, "d_block_sizes must be passed to the kernel")
+
+    def test_m_block_sizes_passed_to_kernel(self):
+        """m_block_sizes kwarg must reach ragged_paged_attention (Phase 2)."""
+        attn_cls = _find_class(self.tree, "Cohere2Attention")
+        method = _find_method(attn_cls, "attention")
+        found = False
+        for node in ast.walk(method):
+            if isinstance(node, ast.Call) and _call_func_name(
+                    node) == "ragged_paged_attention":
+                for kw in node.keywords:
+                    if kw.arg == "m_block_sizes":
+                        found = True
+        self.assertTrue(
+            found, "m_block_sizes must be passed to the kernel (Phase 2)")
+
+    def test_p_block_sizes_passed_to_kernel(self):
+        """p_block_sizes kwarg must reach ragged_paged_attention (Phase 2)."""
+        attn_cls = _find_class(self.tree, "Cohere2Attention")
+        method = _find_method(attn_cls, "attention")
+        found = False
+        for node in ast.walk(method):
+            if isinstance(node, ast.Call) and _call_func_name(
+                    node) == "ragged_paged_attention":
+                for kw in node.keywords:
+                    if kw.arg == "p_block_sizes":
+                        found = True
+        self.assertTrue(
+            found, "p_block_sizes must be passed to the kernel (Phase 2)")
+
+    def test_chunk_prefill_size_passed_to_kernel(self):
+        """chunk_prefill_size kwarg must reach ragged_paged_attention (Phase 2).
+
+        This enables the dedicated PREFILL kernel launch (static q_len),
+        which XLA optimizes more aggressively than the dynamic MIXED path.
+        """
+        attn_cls = _find_class(self.tree, "Cohere2Attention")
+        method = _find_method(attn_cls, "attention")
+        found = False
+        for node in ast.walk(method):
+            if isinstance(node, ast.Call) and _call_func_name(
+                    node) == "ragged_paged_attention":
+                for kw in node.keywords:
+                    if kw.arg == "chunk_prefill_size":
+                        found = True
+        self.assertTrue(
+            found,
+            "chunk_prefill_size must be passed to the kernel (Phase 2: "
+            "enables dedicated PREFILL launch)")
+
+    def test_prefill_chunk_size_default_none(self):
+        """prefill_chunk_size field must default to None (disabled by default;
+        enabling it with a static q_len corrupted KV cache for short prompts)."""
+        attn_cls = _find_class(self.tree, "Cohere2Attention")
+        src = ast.unparse(attn_cls)
+        self.assertIn("prefill_chunk_size", src,
+                      "prefill_chunk_size field must exist (Phase 2)")
+        # The default value must be None (disabled by default for safety).
+        found_none_default = False
+        for node in ast.walk(attn_cls):
+            if isinstance(node, ast.AnnAssign):
+                if (node.target and isinstance(node.target, ast.Name)
+                        and node.target.id == "prefill_chunk_size"
+                        and node.value is not None
+                        and isinstance(node.value, ast.Constant)
+                        and node.value.value is None):
+                    found_none_default = True
+        self.assertTrue(
+            found_none_default,
+            "prefill_chunk_size must default to None (disabled by default)")
+
+    def test_mixed_and_prefill_block_sizes_fields_exist(self):
+        """mixed_block_sizes and prefill_block_sizes fields must exist (Phase 2)."""
+        attn_cls = _find_class(self.tree, "Cohere2Attention")
+        field_names = set()
+        for node in ast.walk(attn_cls):
+            if isinstance(node, ast.AnnAssign) and isinstance(
+                    node.target, ast.Name):
+                field_names.add(node.target.id)
+        self.assertIn(
+            "mixed_block_sizes", field_names,
+            "mixed_block_sizes field must exist (Phase 2)")
+        self.assertIn(
+            "prefill_block_sizes", field_names,
+            "prefill_block_sizes field must exist (Phase 2)")
 
     def test_rope_interleaved_default(self):
         """rope_input_ordering default must be 'interleaved'."""
