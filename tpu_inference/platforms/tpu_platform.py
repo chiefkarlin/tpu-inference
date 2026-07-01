@@ -410,9 +410,16 @@ class TpuPlatform(Platform):
                 raise ValueError(
                     "single_step_decode is not supported with speculative "
                     "decoding")
-            # NOTE: single_step_decode IS compatible with async_scheduling
-            # (unlike continue_decode). The fused dispatch returns
-            # next_tokens which async can copy_to_host_async.
+            if async_scheduling:
+                raise ValueError(
+                    "single_step_decode is not currently supported with "
+                    "async scheduling: _execute_single_step_decode does not "
+                    "implement the _pre_async_results / copy_to_host_async "
+                    "pattern required by async scheduling. Using both "
+                    "together causes stale token substitution on subsequent "
+                    "decode steps, producing garbled output. This restriction "
+                    "will be lifted when the async pattern is implemented for "
+                    "single_step_decode.")
 
             # Apply the same scheduler patch as continue_decode.
             # The patch modifies Scheduler._update_request_with_output to
