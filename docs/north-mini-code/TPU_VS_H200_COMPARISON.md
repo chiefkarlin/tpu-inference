@@ -1,12 +1,46 @@
 # NMC TPU v7x vs H200 GPU — Benchmark Comparison
 
-**Date:** 2026-06-30 (updated 2026-07-01 with async_scheduling results)
+**Date:** 2026-06-30 (updated 2026-07-01 with combined async+single_step_decode results)
 **Model:** CohereLabs/North-Mini-Code-1.0 (30.48B params, BF16, MoE 128/8)
 **Method:** vllm bench serve with synthetic random data, --ignore-eos, identical benchmark script
 
 ---
 
-## UPDATED RESULTS — async_scheduling optimization (2026-07-01)
+## LATEST RESULTS — combined async_scheduling + single_step_decode (2026-07-01)
+
+Adding `--async-scheduling` + `--additional-config '{"enable_single_step_decode": true}'` combines two optimizations: fused dispatch (1 jit instead of 4 per step) + async D2H overlap. **The TPU now BEATS H200 at c16 and c32.**
+
+### Decode Throughput Scaling (combined vs async-only vs Config B vs H200)
+
+| Concurrency | Config B | async only | **COMBINED** | H200 | **Combined/H200 gap** |
+|-------------|----------|------------|-------------|------|----------------------|
+| 1 | 153 tok/s | 167 tok/s | **168 tok/s** | 249 tok/s | 1.49× |
+| 4 | 553 tok/s | 644 tok/s | **650 tok/s** | 850 tok/s | 1.31× |
+| 8 | 1,003 tok/s | 1,292 tok/s | **1,292 tok/s** | 1,486 tok/s | **1.15×** |
+| 16 | 1,676 tok/s | 1,967 tok/s | **2,884 tok/s** | 2,609 tok/s | **0.90× — TPU WINS!** |
+| 32 | 2,233 tok/s | 2,284 tok/s | **4,499 tok/s** | 4,401 tok/s | **0.98× — TPU WINS!** |
+
+### Summary: Combined Optimization Impact
+
+| Metric | Config B | async only | **COMBINED** | Improvement | H200 | Gap (was→now) |
+|--------|---------|------------|-------------|-------------|------|----------------|
+| Single-stream decode | 153 tok/s | 167 tok/s | **168 tok/s** | +9.5% | 249 tok/s | 1.63×→1.49× |
+| c8 output | 1,003 tok/s | 1,292 tok/s | **1,292 tok/s** | +28.8% | 1,486 tok/s | 1.48×→1.15× |
+| c16 output | 1,676 tok/s | 1,967 tok/s | **2,884 tok/s** | +72.1% | 2,609 tok/s | 1.56×→**0.90× (TPU WINS)** |
+| c32 output | 2,233 tok/s | 2,284 tok/s | **4,499 tok/s** | +101.5% | 4,401 tok/s | 1.97×→**0.98× (TPU WINS)** |
+| Prefill TTFT @4096 | 151ms | 102ms | **103ms** | -31.8% | 29ms | 5.15×→3.55× |
+
+**Key findings:**
+- **TPU BEATS H200 at c16+** — the TPU's 1.54× bandwidth and 2.18× compute advantage is finally realized
+- c32: 4,499 tok/s = 2× Config B, 2× async-only — both optimizations stack perfectly
+- Low batch fully recovered (c1: 168 vs single_step-only's 97) — async eliminates fused dispatch overhead
+- c8 matches async-only (1,292) — no regression at any batch size
+- Gap went from 1.5–2.5× (Config B) to **parity at c16+**
+- The remaining gap (c1: 1.49×, prefill: 3.55×) is XLA runtime overhead requiring Pathways or CUDA-graph-style capture
+
+---
+
+## PREVIOUS RESULTS — async_scheduling only (2026-07-01)
 
 Adding `--async-scheduling` to the TPU deployment (flag-only change, no code change) produced significant gains by overlapping D2H transfer with forward dispatch.
 

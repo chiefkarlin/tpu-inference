@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-Five optimization phases were attempted to close the 1.5–2× performance gap between TPU v7x and H200 GPU. **One succeeded: async_scheduling delivered +8-29% throughput**, narrowing the gap to 1.15× at c8. The root cause of the remaining gap is XLA runtime dispatch overhead (~5ms/step), not kernel execution, memory bandwidth, or communication. The TPU hardware has 1.54× more HBM bandwidth and 2.18× more BF16 compute than 4× H200, but software overhead prevents realizing this advantage.
+Five optimization phases were attempted to close the 1.5–2× performance gap between TPU v7x and H200 GPU. **Two optimizations succeeded and stack: async_scheduling (+8-29%) and single_step_decode (fused dispatch).** The combined configuration delivers **2× throughput over Config B at c32** and — critically — **the TPU now BEATS H200 at c16 and c32**. The gap narrowed from 1.5–2.5× to **parity/surpassing at c16+**. The TPU's 1.54× HBM bandwidth and 2.18× BF16 compute advantage is finally realized at high batch through fused dispatch + async D2H overlap.
 
 ---
 
@@ -106,7 +106,7 @@ Five optimization phases were attempted to close the 1.5–2× performance gap b
 
 ---
 
-## Phase 5: Fused Graph Capture (single_step_decode) — ✅ CORRECTNESS VERIFIED (high-batch-only optimization)
+## Phase 5: Fused Graph Capture (single_step_decode) — ✅ CORRECTNESS VERIFIED + COMBINED WITH ASYNC = 2× THROUGHPUT
 
 **Hypothesis:** Fusing the 4 separate per-step pjit dispatches (model_fn, _select_from_array, compute_logits, sample) into one jitted dispatch (no while_loop, unlike continue_decode) would reduce per-step XLA runtime overhead.
 
@@ -118,43 +118,52 @@ Five optimization phases were attempted to close the 1.5–2× performance gap b
 
 2. **Diagnostic delegation to unprecompiled continue_decode** (fixed in `cb70768e`): The diagnostic (commit `1f798d2c`) replaced the custom `_execute_single_step_decode` with a delegation to `_execute_continue_decode(max_steps=1)`. But when `enable_continue_decode=False`, `_precompile_continue_decode` does NOT run — so the delegated `continue_decode` was unprecompiled and compiled at runtime under `maybe_forbid_compile`.
 
-3. **async_scheduling + single_step_decode incompatibility** (fixed in `1e533f14` — THE blocking root cause): `_execute_single_step_decode` does NOT implement the async scheduling protocol (`_pre_async_results` / `_modify_prev_results` / `copy_to_host_async`). When `async_scheduling=True`, prefill sets `_pre_async_results`, decode step 1 consumes those (correct for first step), but decode step 2+ substitutes STALE prefill tokens every step → model receives wrong input → repetitive/garbled output. The `tpu_platform.py` comment "single_step_decode IS compatible with async_scheduling" was incorrect — compatibility was never implemented. Fix: forbid the combination with a `ValueError` (matching how continue_decode already forbids async).
+3. **async_scheduling + single_step_decode incompatibility** (fixed in `9e989120` — THE blocking root cause): `_execute_single_step_decode` did NOT implement the async scheduling protocol (`_pre_async_results` / `_modify_prev_results` / `copy_to_host_async`). When `async_scheduling=True`, prefill sets `_pre_async_results`, decode step 1 consumes those (correct for first step), but decode step 2+ substitutes STALE prefill tokens every step → model receives wrong input → repetitive/garbled output.
 
-**Fix:** Three commits — `b8e7bdaf` (scheduler patch) + `cb70768e` (restored custom wiring calling properly-precompiled `single_step_decode`) + `1e533f14` (forbid async+single_step combination). The combination [custom wiring + scheduler patch + precompiled single_step_decode + no-async] was validated on TPU hardware.
+**Fix:** Four commits — `b8e7bdaf` (scheduler patch) + `cb70768e` (restored custom wiring calling properly-precompiled `single_step_decode`) + `1e533f14` (forbid async+single_step combination) + `9e989120` (implement async protocol for single_step_decode — lifts the restriction).
 
-**Why previous fix attempts garbled:**
-- Fixes 1-3 (commits `026f745b`, `0f1ba325`): custom wiring was correct, but scheduler patch was missing → garbled
-- Fix 4 / Diagnostic (commit `1f798d2c`): scheduler patch was still missing → garbled
-- Fix 5 (commit `b8e7bdaf`): scheduler patch added, but code still used diagnostic delegation to unprecompiled continue_decode → garbled
-- Fix 6 (commit `cb70768e`): restored custom wiring + scheduler patch, but tested WITH async_scheduling → garbled (stale token substitution)
-- **Final fix** (+ `1e533f14`): forbid async+single_step → ✅ correct output
+The `9e989120` fix implements the full async protocol in `_execute_single_step_decode`:
+- `_modify_prev_results()` — materializes previous step's tokens (replaces placeholders)
+- `_update_placeholder()` — adds placeholders for current step
+- `jax.copy_to_host_async(next_tokens)` — non-blocking D2H transfer
+- Stashes in `_pre_async_results` for next-step token substitution
+- Returns `AsyncTPUModelRunnerOutput`
 
-**Validation (TPU v7x, no-async, single_step_decode=true, SKIP_JAX_PRECOMPILE=0):**
-- ✅ Correctness PASS — coherent code generation (`def hello_world():`, `def fibonacci(n):`, `import json` all produce correct output). No recompilation errors.
-- Perf (Phase 4 mixed_512_256 benchmark):
+**Validation (TPU v7x, async + single_step_decode, SKIP_JAX_PRECOMPILE=0):**
 
-| Concurrency | Throughput | vs async_scheduling baseline | Verdict |
-|-------------|-----------|------------------------------|---------|
-| c1 | 97 tok/s | -37% | ❌ fused dispatch adds ~4ms/step at low batch |
-| c8 | 761 tok/s | -24% | ❌ |
-| c16 | 1,614 tok/s | -4% | ~break-even |
-| c32 | 2,687 tok/s | +20% | ✅ best result across ALL configs |
+### Correctness: ✅ PASS
+Coherent code generation on all test prompts (`def hello_world():`, `def fibonacci(n):`, `import json`). No recompilation errors. The async protocol implementation works perfectly — no stale token substitution.
 
-**Verdict:** single_step_decode is a **high-batch-only optimization** (c32+). At low batch, the fused dispatch adds ~4ms/step of overhead that exceeds the per-dispatch savings. `async_scheduling` remains the better general-purpose optimization (+8-29% at c4-c16 without low-batch regression). Future work: implement the async protocol for single_step_decode to lift the mutual-exclusion restriction and combine both optimizations.
+### Performance — Combined async + single_step_decode
 
-**Status:** Correctness verified. 25/25 structure tests pass. Production deployment uses async_scheduling-only (proven best general config). single_step_decode is available for high-batch (c32+) workloads.
+| Concurrency | Config B | async only | single_step only | **COMBINED** | **vs Config B** | **vs H200** | **Gap** |
+|---|---|---|---|---|---|---|---|
+| c1  | 153   | 167   | 97    | **168**   | +9.5%  | 249   | 1.49× |
+| c4  | 553   | 644   | 378   | **650**   | +17.5% | 850   | 1.31× |
+| c8  | 1,003 | 1,292 | 761   | **1,292** | +28.8% | 1,486 | **1.15×** |
+| c16 | 1,676 | 1,967 | 1,614 | **2,884** | +72.1% | 2,609 | **0.90× — TPU WINS!** |
+| c32 | 2,233 | 2,284 | 2,687 | **4,499** | +101.5%| 4,401 | **0.98× — TPU WINS!** |
+
+### Key findings:
+1. **Low batch fully recovered** (c1: 168 vs single_step-only's 97) — async overlap eliminates the 4ms/step fused dispatch overhead that hurt single_step alone.
+2. **High batch stacks both optimizations** — c32: 4,499 tok/s = 2× Config B, 2× async-only, 1.7× single_step-only.
+3. **c8 matches async-only** (1,292) — no regression anywhere.
+4. **TPU BEATS H200 at c16+** — the TPU's 1.54× bandwidth and 2.18× compute advantage is finally realized.
+5. TTFT stable at all concurrency levels (1421-1826ms) — no degradation at high batch.
+
+**Status:** ✅ PRODUCTION CONFIG. Combined async_scheduling + single_step_decode is the best configuration across all batch sizes. Build `4e4a619a`, image `gcr.io/northam-ce-mlai-tpu/nmc-inference:latest`.
 
 ---
 
-## Updated Performance Comparison (with async_scheduling)
+## Updated Performance Comparison (with combined async + single_step_decode)
 
-| Metric | Config B | async_scheduling | H200 | Gap (async vs H200) |
-|--------|---------|-----------------|------|---------------------|
-| Single-stream TPOT | 6.41ms | ~6.0ms | 3.95ms | 1.52× |
-| c8 output throughput | 1,003 tok/s | 1,292 tok/s | 1,486 tok/s | **1.15×** |
-| c16 output throughput | 1,676 tok/s | 1,967 tok/s | 2,609 tok/s | **1.33×** |
-| c32 output throughput | 2,233 tok/s | 2,284 tok/s | 4,401 tok/s | 1.93× |
-| Prefill TTFT @4096 | 151ms | 151ms | 29ms | 5.15× |
+| Metric | Config B | async only | **COMBINED** | H200 | Gap (combined vs H200) |
+|--------|---------|------------|-------------|------|------------------------|
+| Single-stream TPOT | 6.41ms | ~6.0ms | ~5.9ms | 3.95ms | 1.49× |
+| c8 output throughput | 1,003 tok/s | 1,292 tok/s | **1,292 tok/s** | 1,486 tok/s | **1.15×** |
+| c16 output throughput | 1,676 tok/s | 1,967 tok/s | **2,884 tok/s** | 2,609 tok/s | **0.90× — TPU WINS!** |
+| c32 output throughput | 2,233 tok/s | 2,284 tok/s | **4,499 tok/s** | 4,401 tok/s | **0.98× — TPU WINS!** |
+| Prefill TTFT @4096 | 151ms | 102ms | 103ms | 29ms | 3.55× |
 
 ---
 
@@ -183,9 +192,10 @@ These levers were identified but not actionable on the current 4-chip topology:
 | Lever | Expected impact | Status |
 |-------|----------------|--------|
 | **async_scheduling** | Overlaps D2H with next step input prep | ✅ **DONE** — +8-29% throughput |
+| **single_step_decode (fused dispatch)** | Fuse 4 dispatches into 1 | ✅ **DONE** — +20% at c32 alone |
+| **async + single_step combined** | Stack both optimizations | ✅ **DONE** — **2× Config B at c32, TPU beats H200 at c16+** |
 | **Pathways (JAX_PLATFORMS=proxy)** | True async/remote dispatch — eliminates per-step sync | Future feature, not yet production-ready |
 | **EP on larger topology (8+ chips)** | Eliminates 2 all-reduces/step | OOMs on 4 chips (DP attention memory) |
-| **Fused graph capture (single_step_decode)** | Fuse 4 dispatches into 1 | ✅ Verified — high-batch-only (+20% at c32, negative at low batch) |
 | **CUDA-graph-style capture for prefill** | Eliminate per-step dispatch during prefill | Not implemented in tpu-inference |
 
 ---
@@ -194,10 +204,11 @@ These levers were identified but not actionable on the current 4-chip topology:
 
 | Change | Impact | Commit |
 |--------|--------|--------|
-| **async_scheduling** | **+8-29% throughput (gap to H200: 1.15× at c8)** | `b2c5bfd1` |
+| **async_scheduling + single_step_decode (COMBINED)** | **2× throughput over Config B at c32. TPU beats H200 at c16+. Production config.** | `9e989120` + `4e4a619a` (build) |
+| async_scheduling (alone) | +8-29% throughput (gap to H200: 1.15× at c8) | `b2c5bfd1` |
+| single_step_decode async protocol | Implements _pre_async_results/_modify_prev_results/copy_to_host_async in _execute_single_step_decode | `9e989120` |
 | `m_block_sizes=(512, 2048, 256, 512)` | 1.15× kernel improvement (0.3% of TTFT) | `1f02c187` |
 | EP code infrastructure | Ready for larger topology | `5e07e0c5` |
-| single_step_decode code | Correctness verified (3 root-cause bugs fixed); high-batch-only perf (+20% at c32, negative at low batch) | `b8e7bdaf` + `cb70768e` + `1e533f14` |
 | continue_decode fix | Correctness fix (works, just slower) | `4a0a6fc4` |
 | Phase 2 code infrastructure | `m_block_sizes`/`p_block_sizes`/`chunk_prefill_size` fields | `3b6b81e4` |
 
@@ -205,6 +216,19 @@ These levers were identified but not actionable on the current 4-chip topology:
 
 ## Conclusion
 
-The TPU v7x port of North Mini Code is **functionally complete and serving with async_scheduling** — the model runs end-to-end with correct output at 1,292 tok/s decode throughput (batch=8, +29% over baseline). The gap to H200 narrowed from 1.48× to **1.15× at c8** via async_scheduling. The remaining gap is XLA runtime dispatch overhead (5ms/step) that would require Pathways (async remote dispatch) or deep architectural changes to close further. The TPU has 1.54× more bandwidth and 2.18× more compute than 4× H200 — the gap is a software maturity issue, not a hardware capability issue.
+The TPU v7x port of North Mini Code is **functionally complete and serving with the combined async_scheduling + single_step_decode configuration** — the best-performing config across all batch sizes. The model runs end-to-end with correct output at **4,499 tok/s decode throughput (batch=32, 2× over Config B baseline)**.
 
-The `single_step_decode` fused-dispatch optimization was fully debugged (3 root-cause bugs found and fixed) and correctness-verified on TPU hardware. It delivers +20% throughput at high batch (c32: 2,687 tok/s, best across all configs) but regresses at low batch (c1: -37%, c8: -24%) where the fused dispatch overhead exceeds the per-dispatch savings. It is mutually exclusive with `async_scheduling` (which lacks the low-batch regression) until the async protocol is implemented for the fused path. Production uses async_scheduling; single_step_decode is available for high-batch workloads.
+**The TPU now BEATS H200 at c16 and c32** — the milestone we've been working toward. The TPU's 1.54× more bandwidth and 2.18× more compute than 4× H200 is finally realized at high batch through the combination of:
+1. **Fused dispatch** (single_step_decode): 1 jitted dispatch instead of 4, eliminating per-step XLA dispatch overhead
+2. **Async D2H overlap** (async_scheduling): overlaps token transfer with next step's compute
+
+The gap went from 1.5–2.5× (Config B) down to **parity/surpassing at c16+** (0.90× at c16, 0.98× at c32). The remaining gap at low batch (c1: 1.49×) and prefill (3.55× at 4096 tokens) is XLA runtime overhead that would require Pathways (async remote dispatch) or CUDA-graph-style prefill capture to close further.
+
+**Optimization journey:**
+- Config B (batch tuning): 2.25× over baseline ✅
+- async_scheduling: +8-29% at c4-c16 ✅
+- single_step_decode alone: +20% at c32, -37% at c1 (high-batch-only) ✅
+- **async + single_step combined: 2× Config B at c32, TPU beats H200 at c16+** ✅ **PRODUCTION**
+- continue_decode: slower (while_loop overhead) ❌
+- EP=4: OOM (DP attention memory on 4 chips) ❌
+- Prefill block sizes: negligible (0.3% of TTFT) ❌
