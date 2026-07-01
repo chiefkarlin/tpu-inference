@@ -106,27 +106,43 @@ Five optimization phases were attempted to close the 1.5–2× performance gap b
 
 ---
 
-## Phase 5: Fused Graph Capture (single_step_decode) — 🔧 FIX APPLIED (pending TPU validation)
+## Phase 5: Fused Graph Capture (single_step_decode) — ✅ CORRECTNESS VERIFIED (high-batch-only optimization)
 
 **Hypothesis:** Fusing the 4 separate per-step pjit dispatches (model_fn, _select_from_array, compute_logits, sample) into one jitted dispatch (no while_loop, unlike continue_decode) would reduce per-step XLA runtime overhead.
 
 **Method:** New `single_step_decode` function in decode_loop.py + wiring in tpu_runner.py + precompile in compilation_manager.py + validation in tpu_platform.py. 25 structure tests pass.
 
-**Root cause (CONFIRMED):** Two independent bugs, each causing garbled output:
+**Root cause (CONFIRMED — three independent bugs, each causing garbled output):**
 
-1. **Missing scheduler patch** (fixed in `b8e7bdaf`): `patch_vllm_scheduler_for_continue_decode()` was NOT called in the single_step_decode validation block (tpu_platform.py). Without the patch, `Scheduler._update_request_with_output` does not advance `num_computed_tokens` correctly for fused-decode outputs, causing the scheduler to process tokens incorrectly.
+1. **Missing scheduler patch** (fixed in `b8e7bdaf`): `patch_vllm_scheduler_for_continue_decode()` was NOT called in the single_step_decode validation block (tpu_platform.py). Without the patch, `Scheduler._update_request_with_output` does not advance `num_computed_tokens` correctly for fused-decode outputs.
 
-2. **Diagnostic delegation to unprecompiled continue_decode** (fixed in this commit): The diagnostic (commit `1f798d2c`) replaced the custom `_execute_single_step_decode` with a delegation to `_execute_continue_decode(max_steps=1)`. But when `enable_continue_decode=False`, `_precompile_continue_decode` does NOT run — so the delegated `continue_decode` was unprecompiled and compiled at runtime under `maybe_forbid_compile`, producing a different graph and garbled output.
+2. **Diagnostic delegation to unprecompiled continue_decode** (fixed in `cb70768e`): The diagnostic (commit `1f798d2c`) replaced the custom `_execute_single_step_decode` with a delegation to `_execute_continue_decode(max_steps=1)`. But when `enable_continue_decode=False`, `_precompile_continue_decode` does NOT run — so the delegated `continue_decode` was unprecompiled and compiled at runtime under `maybe_forbid_compile`.
 
-**Fix:** Restore the original custom `_execute_single_step_decode` (from commit `0f1ba325`) on top of the scheduler patch (`b8e7bdaf`). The custom implementation calls `single_step_decode` (the jitted function), which IS properly precompiled by `_precompile_single_step_decode` (which runs when `enable_single_step_decode=True`). This combination — [custom wiring + scheduler patch + precompiled single_step_decode] — had never been tested before because the custom wiring was replaced by the diagnostic BEFORE the scheduler patch was applied.
+3. **async_scheduling + single_step_decode incompatibility** (fixed in `1e533f14` — THE blocking root cause): `_execute_single_step_decode` does NOT implement the async scheduling protocol (`_pre_async_results` / `_modify_prev_results` / `copy_to_host_async`). When `async_scheduling=True`, prefill sets `_pre_async_results`, decode step 1 consumes those (correct for first step), but decode step 2+ substitutes STALE prefill tokens every step → model receives wrong input → repetitive/garbled output. The `tpu_platform.py` comment "single_step_decode IS compatible with async_scheduling" was incorrect — compatibility was never implemented. Fix: forbid the combination with a `ValueError` (matching how continue_decode already forbids async).
+
+**Fix:** Three commits — `b8e7bdaf` (scheduler patch) + `cb70768e` (restored custom wiring calling properly-precompiled `single_step_decode`) + `1e533f14` (forbid async+single_step combination). The combination [custom wiring + scheduler patch + precompiled single_step_decode + no-async] was validated on TPU hardware.
 
 **Why previous fix attempts garbled:**
 - Fixes 1-3 (commits `026f745b`, `0f1ba325`): custom wiring was correct, but scheduler patch was missing → garbled
 - Fix 4 / Diagnostic (commit `1f798d2c`): scheduler patch was still missing → garbled
 - Fix 5 (commit `b8e7bdaf`): scheduler patch added, but code still used diagnostic delegation to unprecompiled continue_decode → garbled
-- **This fix**: scheduler patch (b8e7bdaf) + restored custom wiring calling properly-precompiled `single_step_decode` → structure tests pass, pending TPU runtime validation
+- Fix 6 (commit `cb70768e`): restored custom wiring + scheduler patch, but tested WITH async_scheduling → garbled (stale token substitution)
+- **Final fix** (+ `1e533f14`): forbid async+single_step → ✅ correct output
 
-**Status:** Fix applied. 25/25 structure tests pass. Requires TPU runtime validation to confirm correctness and measure performance improvement.
+**Validation (TPU v7x, no-async, single_step_decode=true, SKIP_JAX_PRECOMPILE=0):**
+- ✅ Correctness PASS — coherent code generation (`def hello_world():`, `def fibonacci(n):`, `import json` all produce correct output). No recompilation errors.
+- Perf (Phase 4 mixed_512_256 benchmark):
+
+| Concurrency | Throughput | vs async_scheduling baseline | Verdict |
+|-------------|-----------|------------------------------|---------|
+| c1 | 97 tok/s | -37% | ❌ fused dispatch adds ~4ms/step at low batch |
+| c8 | 761 tok/s | -24% | ❌ |
+| c16 | 1,614 tok/s | -4% | ~break-even |
+| c32 | 2,687 tok/s | +20% | ✅ best result across ALL configs |
+
+**Verdict:** single_step_decode is a **high-batch-only optimization** (c32+). At low batch, the fused dispatch adds ~4ms/step of overhead that exceeds the per-dispatch savings. `async_scheduling` remains the better general-purpose optimization (+8-29% at c4-c16 without low-batch regression). Future work: implement the async protocol for single_step_decode to lift the mutual-exclusion restriction and combine both optimizations.
+
+**Status:** Correctness verified. 25/25 structure tests pass. Production deployment uses async_scheduling-only (proven best general config). single_step_decode is available for high-batch (c32+) workloads.
 
 ---
 
@@ -169,7 +185,7 @@ These levers were identified but not actionable on the current 4-chip topology:
 | **async_scheduling** | Overlaps D2H with next step input prep | ✅ **DONE** — +8-29% throughput |
 | **Pathways (JAX_PLATFORMS=proxy)** | True async/remote dispatch — eliminates per-step sync | Future feature, not yet production-ready |
 | **EP on larger topology (8+ chips)** | Eliminates 2 all-reduces/step | OOMs on 4 chips (DP attention memory) |
-| **Fused graph capture (single_step_decode)** | Fuse 4 dispatches into 1 | 🔧 Fix applied — pending TPU validation |
+| **Fused graph capture (single_step_decode)** | Fuse 4 dispatches into 1 | ✅ Verified — high-batch-only (+20% at c32, negative at low batch) |
 | **CUDA-graph-style capture for prefill** | Eliminate per-step dispatch during prefill | Not implemented in tpu-inference |
 
 ---
@@ -181,7 +197,7 @@ These levers were identified but not actionable on the current 4-chip topology:
 | **async_scheduling** | **+8-29% throughput (gap to H200: 1.15× at c8)** | `b2c5bfd1` |
 | `m_block_sizes=(512, 2048, 256, 512)` | 1.15× kernel improvement (0.3% of TTFT) | `1f02c187` |
 | EP code infrastructure | Ready for larger topology | `5e07e0c5` |
-| single_step_decode code | Fix applied (scheduler patch + restored custom wiring), 25 tests pass, pending TPU validation | `b8e7bdaf` + this commit |
+| single_step_decode code | Correctness verified (3 root-cause bugs fixed); high-batch-only perf (+20% at c32, negative at low batch) | `b8e7bdaf` + `cb70768e` + `1e533f14` |
 | continue_decode fix | Correctness fix (works, just slower) | `4a0a6fc4` |
 | Phase 2 code infrastructure | `m_block_sizes`/`p_block_sizes`/`chunk_prefill_size` fields | `3b6b81e4` |
 
@@ -190,3 +206,5 @@ These levers were identified but not actionable on the current 4-chip topology:
 ## Conclusion
 
 The TPU v7x port of North Mini Code is **functionally complete and serving with async_scheduling** — the model runs end-to-end with correct output at 1,292 tok/s decode throughput (batch=8, +29% over baseline). The gap to H200 narrowed from 1.48× to **1.15× at c8** via async_scheduling. The remaining gap is XLA runtime dispatch overhead (5ms/step) that would require Pathways (async remote dispatch) or deep architectural changes to close further. The TPU has 1.54× more bandwidth and 2.18× more compute than 4× H200 — the gap is a software maturity issue, not a hardware capability issue.
+
+The `single_step_decode` fused-dispatch optimization was fully debugged (3 root-cause bugs found and fixed) and correctness-verified on TPU hardware. It delivers +20% throughput at high batch (c32: 2,687 tok/s, best across all configs) but regresses at low batch (c1: -37%, c8: -24%) where the fused dispatch overhead exceeds the per-dispatch savings. It is mutually exclusive with `async_scheduling` (which lacks the low-batch regression) until the async protocol is implemented for the fused path. Production uses async_scheduling; single_step_decode is available for high-batch workloads.
