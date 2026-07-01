@@ -332,6 +332,172 @@ def single_step_decode(
     return kv_caches, next_tokens, expert_indices
 
 
+# ---------------------------------------------------------------------------
+# DEBUG differential variants (enabled via TPU_SSD_DEBUG=1 in tpu_runner).
+#
+# These two functions are byte-for-byte identical to single_step_decode and to
+# continue_decode's _run_one_step body respectively, EXCEPT that:
+#   * they do NOT donate kv_caches (so both can run on the same caches), and
+#   * they additionally return hidden_states and logits.
+#
+# The ONLY computational difference between the two debug variants is how
+# ``padded_num_reqs`` is handled:
+#   * single_step_decode_debug  -> uses attn_metadata AS-IS (padded_num_reqs =
+#     attn_padded_num_reqs, as built by _prepare_inputs).
+#   * continue_one_step_debug   -> REBUILDS AttentionMetadata WITHOUT
+#     padded_num_reqs (-> -1), exactly as _decode_core._run_one_step does.
+#
+# Running both on identical inputs and comparing hidden_states / logits /
+# next_tokens localizes the divergence stage deterministically. See
+# TPUModelRunner._debug_single_step_decode for the driver.
+# ---------------------------------------------------------------------------
+
+
+_DEBUG_COMPILER_OPTIONS = {
+    "xla_tpu_all_gather_collective_matmul_mode": "post_spmd_conservative",
+    "xla_tpu_reduce_scatter_collective_matmul_mode":
+    "post_spmd_conservative",
+    "xla_tpu_use_minor_sharding_for_major_trivial_input": "true"
+}
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "model_fn",
+        "compute_logits_fn",
+        "sample_fn",
+        "mesh",
+        "layer_name_to_kvcache_index",
+        "is_first_rank",
+        "is_last_rank",
+    ),
+    # NOTE: NO donate_argnames -- debug variant must not donate so both paths
+    # can execute against the same kv_caches for differential comparison.
+    compiler_options=_DEBUG_COMPILER_OPTIONS,
+)
+def single_step_decode_debug(
+    *,
+    state,
+    kv_caches,
+    rng,
+    input_ids,
+    attn_metadata,
+    input_positions,
+    sampling_metadata,
+    inputs_embeds,
+    lora_metadata,
+    intermediate_tensors,
+    model_fn,
+    compute_logits_fn,
+    sample_fn,
+    mesh,
+    layer_name_to_kvcache_index,
+    is_first_rank,
+    is_last_rank,
+):
+    """DEBUG variant of single_step_decode returning hidden_states + logits.
+
+    Computes the SAME result as single_step_decode but additionally returns
+    ``hidden_states`` (post model_fn) and ``logits`` (post compute_logits_fn)
+    so a differential comparison against continue_decode's _run_one_step can
+    localize the divergence stage. Does NOT donate kv_caches.
+    """
+    kv_caches, hidden_states, _, expert_indices = model_fn(
+        state,
+        kv_caches,
+        input_ids,
+        attn_metadata,
+        inputs_embeds,
+        input_positions,
+        layer_name_to_kvcache_index,
+        lora_metadata,
+        intermediate_tensors,
+        is_first_rank,
+        is_last_rank,
+    )
+    logits = compute_logits_fn(state, hidden_states, None)
+    logits = logits.astype(jnp.float32)
+    next_tokens, _ = sample_fn(rng, mesh, logits, sampling_metadata)
+    return (kv_caches, next_tokens, expert_indices, hidden_states, logits)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "model_fn",
+        "compute_logits_fn",
+        "sample_fn",
+        "mesh",
+        "layer_name_to_kvcache_index",
+        "is_first_rank",
+        "is_last_rank",
+    ),
+    compiler_options=_DEBUG_COMPILER_OPTIONS,
+)
+def continue_one_step_debug(
+    *,
+    state,
+    kv_caches,
+    rng,
+    input_ids,
+    attn_metadata,
+    input_positions,
+    sampling_metadata,
+    inputs_embeds,
+    lora_metadata,
+    intermediate_tensors,
+    model_fn,
+    compute_logits_fn,
+    sample_fn,
+    mesh,
+    layer_name_to_kvcache_index,
+    is_first_rank,
+    is_last_rank,
+):
+    """DEBUG variant replicating continue_decode's _run_one_step for step 0.
+
+    Rebuilds a NEW AttentionMetadata WITHOUT ``padded_num_reqs`` (it defaults
+    to -1), exactly as ``_decode_core._run_one_step`` does. This is the ONLY
+    computational difference from ``single_step_decode_debug``. Returns the
+    same intermediate tuple so the two can be compared stage-by-stage. Does
+    NOT donate kv_caches.
+
+    NOTE: unlike production ``_run_one_step`` (which splits the rng via
+    ``_split_rngs`` and indexes ``step_rngs[0]``), this debug variant uses the
+    passed ``rng`` directly. This is intentional: it makes the rng IDENTICAL
+    to ``single_step_decode_debug`` so the differential isolates
+    ``padded_num_reqs`` as the only variable. For greedy sampling (the
+    primary debug case) rng is unused anyway.
+    """
+    am = AttentionMetadata(
+        input_positions=attn_metadata.input_positions,
+        block_tables=attn_metadata.block_tables,
+        seq_lens=attn_metadata.seq_lens,
+        query_start_loc=attn_metadata.query_start_loc,
+        request_distribution=attn_metadata.request_distribution,
+        mamba_state_indices=attn_metadata.mamba_state_indices,
+        # padded_num_reqs intentionally NOT set -> -1 (matches _run_one_step).
+    )
+    kv_caches, hidden_states, _, expert_indices = model_fn(
+        state,
+        kv_caches,
+        input_ids,
+        am,
+        inputs_embeds,
+        am.input_positions,
+        layer_name_to_kvcache_index,
+        lora_metadata,
+        intermediate_tensors,
+        is_first_rank,
+        is_last_rank,
+    )
+    logits = compute_logits_fn(state, hidden_states, None)
+    logits = logits.astype(jnp.float32)
+    next_tokens, _ = sample_fn(rng, mesh, logits, sampling_metadata)
+    return (kv_caches, next_tokens, expert_indices, hidden_states, logits)
+
+
 def continue_decode(
     state: dict,
     model_fn: Callable,

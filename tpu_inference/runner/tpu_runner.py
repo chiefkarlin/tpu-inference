@@ -74,7 +74,8 @@ from tpu_inference.models.jax.utils.weight_utils import (
 from tpu_inference.runner import utils as runner_utils
 from tpu_inference.runner.compilation_manager import CompilationManager
 from tpu_inference.runner.decode_loop import (
-    TpuSamplingState, continue_decode, single_step_decode)
+    TpuSamplingState, continue_decode, continue_one_step_debug,
+    single_step_decode, single_step_decode_debug)
 from tpu_inference.runner.input_batch import CachedRequestState, InputBatch
 from tpu_inference.runner.kv_cache_manager import KVCacheManager
 from tpu_inference.runner.lora_utils import LoraUtils
@@ -1663,6 +1664,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         the properly-precompiled ``single_step_decode``) on top of the
         scheduler patch fixes both issues.
         """
+        import os
+        if os.environ.get("TPU_SSD_DEBUG") == "1":
+            return self._debug_single_step_decode(scheduler_output)
         (
             input_ids,
             input_positions,
@@ -1814,6 +1818,254 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if routed_experts is not None:
             output.routed_experts = routed_experts
 
+        self._continue_decode_output = output
+        return None
+
+    def _debug_single_step_decode(
+        self,
+        scheduler_output: "VllmSchedulerOutput",
+    ) -> None:
+        """Differential debug harness for single_step_decode (TPU_SSD_DEBUG=1).
+
+        Runs BOTH ``single_step_decode_debug`` (path under test) AND
+        ``continue_one_step_debug`` (proven-correct oracle, replicating
+        ``_decode_core._run_one_step`` for step 0) on the SAME prepared
+        inputs and kv_caches, then compares ``hidden_states``, ``logits`` and
+        ``next_tokens`` stage-by-stage to localize the divergence.
+
+        The ONLY computational difference between the two debug functions is
+        ``padded_num_reqs`` (single_step uses ``attn_padded_num_reqs`` from
+        ``_prepare_inputs``; continue_one_step rebuilds attn_metadata WITHOUT
+        it -> -1, exactly as production ``_run_one_step``). So:
+
+          * If ``hidden_states`` DIVERGE  -> the bug is the ``padded_num_reqs``
+            difference (GDN attention slicing in gdn_attention_op.py:128-138).
+          * If ``hidden_states`` MATCH but ``logits``/``next_tokens`` diverge
+            -> the bug is downstream of model_fn (compute_logits / sample).
+          * If EVERYTHING matches -> the bug is in host-side token extraction
+            or multi-step state accumulation, NOT in the fused jit body.
+
+        Both debug variants skip kv_caches donation so they can execute
+        against the same caches. State is progressed from the single_step
+        result (the path under test).
+
+        Results are logged with ``[SSD-DEBUG]`` prefixes and dumped to
+        ``/tmp/ssd_debug.npz`` for offline analysis.
+        """
+        import os
+        print("[SSD-DEBUG] ===== single_step vs continue_one_step differential "
+              "=====")
+
+        (
+            input_ids,
+            input_positions,
+            attn_metadata,
+            sampling_metadata,
+            logits_indices,
+            spec_decode_metadata,
+            logits_indices_selector,
+            padded_num_reqs,
+            req_ids_dp,
+            padded_num_scheduled_tokens_per_dp_rank,
+        ) = self._prepare_inputs(scheduler_output)
+
+        token_batch_size = input_ids.shape[0]
+        ss_pnr = getattr(attn_metadata, "padded_num_reqs", -1)
+        print(f"[SSD-DEBUG] token_batch_size={token_batch_size} "
+              f"padded_num_reqs={padded_num_reqs} "
+              f"attn_metadata.padded_num_reqs(single_step)={ss_pnr} "
+              f"(continue_one_step uses -1) do_sampling="
+              f"{bool(sampling_metadata.do_sampling)}")
+
+        # Pad sampling_metadata to token_batch_size (mirror production path).
+        if (sampling_metadata.temperature is not None
+                and token_batch_size != padded_num_reqs):
+            _pad_len = token_batch_size - padded_num_reqs
+            _pad_temp = jnp.full((_pad_len, ), 1.0,
+                                 dtype=sampling_metadata.temperature.dtype)
+            _pad_topk = jnp.zeros((_pad_len, ),
+                                  dtype=sampling_metadata.top_k.dtype)
+            _pad_topp = jnp.ones((_pad_len, ),
+                                 dtype=sampling_metadata.top_p.dtype)
+            sampling_metadata = TPUSupportedSamplingMetadata(
+                temperature=jnp.concatenate(
+                    [sampling_metadata.temperature, _pad_temp]),
+                top_k=jnp.concatenate(
+                    [sampling_metadata.top_k, _pad_topk]),
+                top_p=jnp.concatenate(
+                    [sampling_metadata.top_p, _pad_topp]),
+                _cache_collision_dummy=sampling_metadata._cache_collision_dummy,
+                do_sampling=sampling_metadata.do_sampling,
+                logprobs=sampling_metadata.logprobs,
+            )
+
+        input_ids, inputs_embeds = self._get_input_ids_embeds(
+            input_ids, None, None)
+        lora_metadata = self.lora_utils.extract_lora_metadata()
+
+        # Same rng for both paths (isolates padded_num_reqs as the only var).
+        if sampling_metadata.do_sampling:
+            _unused, step_rng = jax.random.split(self.rng_params_for_sampling)
+        else:
+            step_rng = self.rng_params_for_sampling
+
+        from tpu_inference.layers.jax.sample.sampling import sample
+        model_fn = getattr(self.model, "step_fn_no_options", self.model_fn)
+        l2k = tuple(self.layer_name_to_kvcache_index.items())
+
+        with self.maybe_forbid_compile, \
+                set_forward_context(None, self.vllm_config), \
+                self.maybe_get_kv_connector_output(
+                    scheduler_output) as kv_connector_output:
+            # 1. Oracle: continue_one_step_debug (padded_num_reqs=-1).
+            (_kv_cd, next_tokens_cd, _exp_cd, hidden_cd,
+             logits_cd) = continue_one_step_debug(
+                 state=self.state_leaves,
+                 kv_caches=self.kv_caches,
+                 rng=step_rng,
+                 input_ids=input_ids,
+                 attn_metadata=attn_metadata,
+                 input_positions=input_positions,
+                 sampling_metadata=sampling_metadata,
+                 inputs_embeds=inputs_embeds,
+                 lora_metadata=lora_metadata,
+                 intermediate_tensors=None,
+                 model_fn=model_fn,
+                 compute_logits_fn=self.compute_logits_fn,
+                 sample_fn=sample,
+                 mesh=self.mesh,
+                 layer_name_to_kvcache_index=l2k,
+                 is_first_rank=self.is_first_rank,
+                 is_last_rank=self.is_last_rank,
+             )
+            # 2. Path under test: single_step_decode_debug
+            #    (padded_num_reqs=attn_padded_num_reqs).
+            (kv_ss, next_tokens_ss, _exp_ss, hidden_ss,
+             logits_ss) = single_step_decode_debug(
+                 state=self.state_leaves,
+                 kv_caches=self.kv_caches,
+                 rng=step_rng,
+                 input_ids=input_ids,
+                 attn_metadata=attn_metadata,
+                 input_positions=input_positions,
+                 sampling_metadata=sampling_metadata,
+                 inputs_embeds=inputs_embeds,
+                 lora_metadata=lora_metadata,
+                 intermediate_tensors=None,
+                 model_fn=model_fn,
+                 compute_logits_fn=self.compute_logits_fn,
+                 sample_fn=sample,
+                 mesh=self.mesh,
+                 layer_name_to_kvcache_index=l2k,
+                 is_first_rank=self.is_first_rank,
+                 is_last_rank=self.is_last_rank,
+             )
+
+        # Progress state from the path under test.
+        self.kv_caches = kv_ss
+
+        # device_get all intermediates to host for comparison.
+        (hidden_cd_h, hidden_ss_h, logits_cd_h, logits_ss_h, nt_cd_h,
+         nt_ss_h) = jax.device_get((hidden_cd, hidden_ss, logits_cd,
+                                    logits_ss, next_tokens_cd,
+                                    next_tokens_ss))
+
+        def _cmp(name, a, b):
+            a = np.asarray(a)
+            b = np.asarray(b)
+            if a.shape != b.shape:
+                print(f"[SSD-DEBUG] {name}: SHAPE MISMATCH {a.shape} vs "
+                      f"{b.shape}")
+                return
+            if a.dtype.kind == "f":
+                exact = np.array_equal(a, b)
+                fdiff = a.astype(np.float64) - b.astype(np.float64)
+                maxdiff = float(np.max(np.abs(fdiff))) if a.size else 0.0
+                nan_a = bool(np.any(~np.isfinite(a)))
+                nan_b = bool(np.any(~np.isfinite(b)))
+                status = "MATCH" if exact else "DIVERGE"
+                print(f"[SSD-DEBUG] {name}: {status} "
+                      f"(max_abs_diff={maxdiff:.6e} nan_ss={nan_a} "
+                      f"nan_cd={nan_b} shape={a.shape})")
+                if not exact and a.size > 0:
+                    first = np.unravel_index(
+                        np.argmax(fdiff != 0), a.shape)
+                    print(f"[SSD-DEBUG]   first diff at {first}: "
+                          f"ss={a[first]} cd={b[first]}")
+            else:
+                exact = np.array_equal(a, b)
+                status = "MATCH" if exact else "DIVERGE"
+                print(f"[SSD-DEBUG] {name}: {status} (shape={a.shape} "
+                      f"dtype={a.dtype})")
+                if not exact and a.size > 0:
+                    neq = a != b
+                    first = np.unravel_index(np.argmax(neq), a.shape)
+                    print(f"[SSD-DEBUG]   first diff at {first}: "
+                          f"ss={a[first]} cd={b[first]}")
+
+        _cmp("hidden_states", hidden_ss_h, hidden_cd_h)
+        _cmp("logits", logits_ss_h, logits_cd_h)
+        _cmp("next_tokens", nt_ss_h, nt_cd_h)
+        print(f"[SSD-DEBUG] single_step next_tokens[:8] = "
+              f"{np.asarray(nt_ss_h)[:8]}")
+        print(f"[SSD-DEBUG] continue   next_tokens[:8] = "
+              f"{np.asarray(nt_cd_h)[:8]}")
+
+        # Dump for offline analysis.
+        try:
+            np.savez(
+                "/tmp/ssd_debug.npz",
+                hidden_ss=hidden_ss_h,
+                hidden_cd=hidden_cd_h,
+                logits_ss=logits_ss_h,
+                logits_cd=logits_cd_h,
+                next_tokens_ss=nt_ss_h,
+                next_tokens_cd=nt_cd_h,
+                input_ids=np.asarray(jax.device_get(input_ids)),
+                input_positions=np.asarray(jax.device_get(input_positions)),
+            )
+            print("[SSD-DEBUG] dumped intermediates to /tmp/ssd_debug.npz")
+        except Exception as e:  # noqa: BLE001
+            print(f"[SSD-DEBUG] dump failed: {e}")
+        print("[SSD-DEBUG] ===== end differential =====")
+
+        # Construct ModelRunnerOutput from the single_step result so serving
+        # continues correctly (mirrors _execute_single_step_decode extraction).
+        next_tokens_cpu = np.asarray(nt_ss_h)
+        logits_indices_cpu = np.asarray(jax.device_get(logits_indices))
+        selected_tokens = next_tokens_cpu[logits_indices_cpu]
+        if logits_indices_selector is not None:
+            selected_tokens = selected_tokens[logits_indices_selector]
+
+        num_reqs = self.input_batch.num_reqs
+        sampled_token_ids = []
+        for req_idx in range(num_reqs):
+            token_id = int(selected_tokens[req_idx])
+            sampled_token_ids.append([token_id])
+            req_id = self.input_batch.req_ids[req_idx]
+            req_state = self.requests.get(req_id)
+            if req_state is not None:
+                start_idx = self.input_batch.num_tokens_no_spec[req_idx]
+                end_idx = start_idx + 1
+                if req_idx < self.max_num_reqs and end_idx <= self.max_model_len:
+                    self.input_batch.token_ids_cpu[
+                        req_idx, start_idx:end_idx] = token_id
+                    self.input_batch.num_tokens_no_spec[req_idx] = end_idx
+                    self.input_batch.num_tokens[req_idx] = end_idx
+                    req_state.output_token_ids.append(token_id)
+            if hasattr(attn_metadata,
+                       "seq_lens_cpu") and attn_metadata.seq_lens_cpu is not None:
+                attn_metadata.seq_lens_cpu[req_idx] += 1
+
+        output = ModelRunnerOutput(
+            req_ids=self.input_batch.req_ids[:num_reqs],
+            req_id_to_index=self.input_batch.req_id_to_index.copy(),
+            sampled_token_ids=sampled_token_ids,
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            kv_connector_output=kv_connector_output,
+        )
         self._continue_decode_output = output
         return None
 

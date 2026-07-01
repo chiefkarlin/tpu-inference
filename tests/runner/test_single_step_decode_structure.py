@@ -341,11 +341,19 @@ class TestTpuPlatformValidation(unittest.TestCase):
             "must validate single_step_decode is mutually exclusive with "
             "continue_decode")
 
-    def test_compatible_with_async_scheduling(self):
-        """single_step_decode must NOT be mutually exclusive with
-        async_scheduling (unlike continue_decode)."""
-        # Read raw file content (ast.unparse strips comments, and the
-        # compatibility note is in a comment).
+    def test_mutually_exclusive_with_async_scheduling(self):
+        """single_step_decode MUST be mutually exclusive with async_scheduling.
+
+        ``_execute_single_step_decode`` does not implement the async pattern
+        (``_pre_async_results`` / ``copy_to_host_async`` /
+        ``_modify_prev_results``). Combining single_step_decode with
+        async_scheduling causes stale token substitution on subsequent decode
+        steps (the prefill's next_tokens are re-substituted every step),
+        producing garbled repetitive output. This matches continue_decode's
+        restriction. The restriction will be lifted only when the async
+        pattern is implemented for single_step_decode.
+        """
+        # Read raw file content (ast.unparse strips comments).
         with open(_TPU_PLATFORM_PATH, "r") as f:
             raw_src = f.read()
         # Find the single_step_decode validation block.
@@ -354,15 +362,26 @@ class TestTpuPlatformValidation(unittest.TestCase):
                            "must have 'if enable_single_step_decode:' block")
         # Get the block from the if to the next method definition.
         ssd_block = raw_src[ssd_idx:]
-        # The block should NOT raise on async_scheduling.
-        self.assertNotIn(
-            "not supported with async", ssd_block.lower(),
-            "single_step_decode must NOT reject async_scheduling "
-            "(unlike continue_decode)")
-        # Should have a comment about compatibility.
-        self.assertIn("compatible", ssd_block.lower(),
-                      "single_step_decode should document compatibility "
-                      "with async_scheduling")
+        # The block MUST reference and raise on async_scheduling.
+        self.assertIn(
+            "async_scheduling", ssd_block,
+            "single_step_decode must reference async_scheduling in its "
+            "validation block")
+        self.assertIn(
+            "raise ValueError", ssd_block,
+            "single_step_decode must raise ValueError when async_scheduling "
+            "is enabled")
+        # Confirm the raise is gated on async_scheduling within the block
+        # (cheap textual check that 'async' appears before the next
+        # 'def ' / decorator, which delimits the block).
+        block_end = ssd_block.find("\n    @")
+        if block_end == -1:
+            block_end = ssd_block.find("\n    def ")
+        block = ssd_block[:block_end] if block_end > 0 else ssd_block
+        self.assertIn(
+            "async_scheduling", block,
+            "the async_scheduling check must live inside the "
+            "enable_single_step_decode validation block")
 
 
 if __name__ == "__main__":
