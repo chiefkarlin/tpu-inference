@@ -1166,7 +1166,21 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             request_seq_lens,
             scheduler_output: "VllmSchedulerOutput",
             logits_indices_selector=None,
-            spec_decode_metadata: Optional[SpecDecodeMetadata] = None):
+            spec_decode_metadata: Optional[SpecDecodeMetadata] = None,
+            logits_indices: Optional[np.ndarray] = None):
+        """Map each request to its index in the previous step's next_tokens.
+
+        For the standard path (logits_indices=None), next_tokens is shaped
+        (padded_num_reqs,) — one token per request — so the index is the
+        request index (or logits_indices_selector[req_idx] for DP reordering).
+
+        For the fused path (logits_indices is set), next_tokens is shaped
+        (token_batch_size,) — one token per token POSITION — so the index
+        must be the TOKEN POSITION of the request's last token, obtained
+        from logits_indices[req_idx].  For decode this is a no-op
+        (logits_indices[i] == i), but for prefill logits_indices[i] != i
+        because each request has multiple tokens.
+        """
         placeholder_req_id_to_index: dict[str, int] = {}
         discard_sampled_tokens_req_indices_set = set(
             discard_sampled_tokens_req_indices)
@@ -1190,7 +1204,18 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
             # For placeholder, should be update on next execute.
             req_state.output_token_ids.extend([0] * (end_idx - start_idx))
-            if logits_indices_selector is None:
+            if logits_indices is not None:
+                # Fused path: next_tokens is (token_batch_size,), index by
+                # token position.  For DP, logits_indices_selector gives the
+                # position in the DP-reordered logits_indices array.
+                if logits_indices_selector is not None:
+                    sel_idx = logits_indices_selector[req_idx]
+                    placeholder_req_id_to_index[req_state.req_id] = int(
+                        logits_indices[sel_idx])
+                else:
+                    placeholder_req_id_to_index[req_state.req_id] = int(
+                        logits_indices[req_idx])
+            elif logits_indices_selector is None:
                 placeholder_req_id_to_index[req_state.req_id] = req_idx
             else:
                 placeholder_req_id_to_index[
@@ -1815,7 +1840,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             placeholder_req_id_to_index = self._update_placeholder(
                 discard_sampled_tokens_req_indices, request_seq_lens,
                 scheduler_output, logits_indices_selector,
-                spec_decode_metadata)
+                spec_decode_metadata,
+                logits_indices=logits_indices_np)
 
             # Non-blocking D2H transfer of current step's tokens.
             next_tokens = jax.copy_to_host_async(next_tokens)
@@ -2078,7 +2104,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             placeholder_req_id_to_index = self._update_placeholder(
                 discard_sampled_tokens_req_indices, request_seq_lens,
                 scheduler_output, logits_indices_selector,
-                spec_decode_metadata)
+                spec_decode_metadata,
+                logits_indices=logits_indices_np)
 
             next_tokens = jax.copy_to_host_async(next_tokens)
             self._pre_async_results = AsyncPreResults(
