@@ -5,10 +5,11 @@
 # GKE auto-taints Flex nodes with google.com/tpu + cloud.google.com/gke-queued.
 # Pods MUST tolerate both taints or the autoscaler won't request capacity.
 #
-# Async scheduling: overlaps previous step's D2H transfer with next step's
-# input prep + forward dispatch. Confirmed +8-29% throughput improvement at
-# c4-c16 over Config B baseline. Uses explicit command/args array (NOT
-# VLLM_ARGS env) to avoid shell word-splitting issues.
+# Production config: async_scheduling + single_step_decode (combined).
+# - async_scheduling: overlaps D2H transfer with next step's compute
+# - single_step_decode: fuses 4 per-step pjit dispatches into 1 jitted dispatch
+# Combined: 2× Config B throughput at c32, TPU beats H200 at c16+.
+# Requires SKIP_JAX_PRECOMPILE=0 (single_step_decode precompilation).
 #
 # Usage:
 #   kubectl apply -f nmc-v7x-deployment.yaml
@@ -97,6 +98,8 @@ spec:
             - --seed
             - "42"
             - --async-scheduling
+            - --additional-config
+            - '{"enable_single_step_decode": true}'
           env:
             - name: HUGGING_FACE_HUB_TOKEN
               valueFrom:
@@ -104,7 +107,7 @@ spec:
                   name: hf-token-secret
                   key: token
             - name: SKIP_JAX_PRECOMPILE
-              value: "1"
+              value: "0"  # REQUIRED: single_step_decode precompilation must run
             - name: VLLM_XLA_CHECK_RECOMPILATION
               value: "0"
             - name: ATTN_BUCKETIZED_NUM_REQS
