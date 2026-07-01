@@ -410,16 +410,13 @@ class TpuPlatform(Platform):
                 raise ValueError(
                     "single_step_decode is not supported with speculative "
                     "decoding")
-            if async_scheduling:
-                raise ValueError(
-                    "single_step_decode is not currently supported with "
-                    "async scheduling: _execute_single_step_decode does not "
-                    "implement the _pre_async_results / copy_to_host_async "
-                    "pattern required by async scheduling. Using both "
-                    "together causes stale token substitution on subsequent "
-                    "decode steps, producing garbled output. This restriction "
-                    "will be lifted when the async pattern is implemented for "
-                    "single_step_decode.")
+            # NOTE: single_step_decode IS compatible with async_scheduling.
+            # _execute_single_step_decode implements the full async protocol
+            # (_pre_async_results / _modify_prev_results / _update_placeholder
+            # / copy_to_host_async), overlapping step N's D2H transfer with
+            # step N+1's compute.  The logits_indices gathering (needed
+            # because single_step samples ALL token-padded positions) is
+            # threaded through AsyncPreResults and host_extract_sampled_tokens.
 
             # Apply the same scheduler patch as continue_decode.
             # The patch modifies Scheduler._update_request_with_output to

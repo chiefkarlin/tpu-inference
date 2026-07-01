@@ -145,12 +145,14 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
                  scheduler_output: Optional["VllmSchedulerOutput"] = None,
                  req_ids_dp: Optional[Dict] = None,
                  padded_num_scheduled_tokens_per_dp_rank: int = 0,
-                 runner=None):
+                 runner=None,
+                 logits_indices: Optional[np.ndarray] = None):
         self._model_runner_output = model_runner_output
         self._next_tokens = next_tokens
         self._num_reqs = num_reqs
         self._discard_sampled_tokens_req_indices = discard_sampled_tokens_req_indices
         self.logits_indices_selector: list[int] = logits_indices_selector
+        self._logits_indices = logits_indices
         self._logprobs_tensors = logprobs_tensors
         self._prompt_logprobs_async_data = prompt_logprobs_async_data
         self._expert_indices = expert_indices
@@ -165,7 +167,8 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         valid_sampled_token_ids = runner_utils.host_extract_sampled_tokens(
             self._runner, self._spec_decode_metadata, self._next_tokens,
             self.logits_indices_selector,
-            self._discard_sampled_tokens_req_indices, self._num_reqs)
+            self._discard_sampled_tokens_req_indices, self._num_reqs,
+            logits_indices=self._logits_indices)
 
         self._model_runner_output.sampled_token_ids = valid_sampled_token_ids
 
@@ -210,6 +213,10 @@ class AsyncPreResults:
     discard_sampled_tokens_req_indices: list[int]
     placeholder_req_id_to_index: dict[str, int]
     logits_indices_selector: Optional[List[int]] = None
+    # Numpy array of position indices for single_step_decode, which samples
+    # ALL token-padded positions.  None for the standard path (which
+    # pre-selects hidden_states before compute_logits).
+    logits_indices: Optional[np.ndarray] = None
     scheduler_output: "VllmSchedulerOutput" = None
 
     # Only when spec decoding is enabled, the follow variables
@@ -1099,13 +1106,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         pre_request_seq_lens = self._pre_async_results.request_seq_lens
         pre_discard_sampled_tokens_req_indices = self._pre_async_results.discard_sampled_tokens_req_indices
         pre_logits_indices_selector = self._pre_async_results.logits_indices_selector
+        pre_logits_indices = self._pre_async_results.logits_indices
         pre_spec_decode_metadata = self._pre_async_results.spec_decode_metadata
         pre_scheduler_output = self._pre_async_results.scheduler_output
 
         valid_sampled_token_ids = runner_utils.host_extract_sampled_tokens(
             self, pre_spec_decode_metadata, pre_next_tokens,
             pre_logits_indices_selector,
-            pre_discard_sampled_tokens_req_indices, pre_num_reqs)
+            pre_discard_sampled_tokens_req_indices, pre_num_reqs,
+            logits_indices=pre_logits_indices)
 
         # Append sampled tokens
         for pre_req_idx, req_state, _ in pre_request_seq_lens:
@@ -1649,6 +1658,16 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         ``logits_indices``.  Eliminates ~3-15 ms/step of per-dispatch XLA
         runtime overhead.
 
+        Supports both synchronous and async scheduling paths.  When
+        ``async_scheduling=True``, the function implements the full async
+        protocol (``_pre_async_results`` / ``_modify_prev_results`` /
+        ``_update_placeholder`` / ``copy_to_host_async``) so that step N's
+        D2H transfer overlaps with step N+1's compute.  The key difference
+        from the standard async path is that ``single_step_decode`` samples
+        ALL token-padded positions, so ``logits_indices`` gathering is
+        threaded through ``AsyncPreResults`` and ``host_extract_sampled_tokens``
+        to select the relevant positions during host extraction.
+
         Root cause history: the original custom wiring garbled because
         ``patch_vllm_scheduler_for_continue_decode()`` was NOT called in
         the single_step_decode validation block (tpu_platform.py).  The
@@ -1661,7 +1680,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         was unprecompiled and compiled at runtime under
         ``maybe_forbid_compile``.  Restoring the custom wiring (which calls
         the properly-precompiled ``single_step_decode``) on top of the
-        scheduler patch fixes both issues.
+        scheduler patch fixes both issues.  A third bug — async_scheduling
+        incompatibility (stale token substitution) — was fixed by
+        implementing the async protocol in this function (originally
+        forbidden by commit 1e533f14, now lifted).
         """
         (
             input_ids,
@@ -1747,6 +1769,95 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         self.kv_caches = kv_caches
 
+        num_reqs = self.input_batch.num_reqs
+
+        # --- Async scheduling path ---
+        # Overlaps this step's D2H transfer with the next step's compute.
+        # Mirrors the standard async path in _sample_from_logits but
+        # handles the single_step_decode difference: next_tokens has ALL
+        # token-padded positions, so logits_indices gathering is needed
+        # during host extraction (stored in AsyncPreResults / passed to
+        # host_extract_sampled_tokens).
+        if self.scheduler_config.async_scheduling:
+            # Convert logits_indices to numpy for host-side extraction.
+            # This is small (padded_num_reqs elements) and likely already
+            # on host, so the blocking device_get is negligible.
+            logits_indices_np = np.asarray(jax.device_get(logits_indices))
+
+            # Build request_seq_lens and discard_sampled_tokens_req_indices
+            # (same logic as standard path).
+            request_seq_lens: list[tuple[int, CachedRequestState, int]] = []
+            discard_sampled_tokens_req_indices = []
+            for i, req_id in zip(range(num_reqs),
+                                 self.input_batch.req_ids):
+                assert req_id is not None
+                req_state = self.requests[req_id]
+                seq_len = (req_state.num_computed_tokens +
+                           scheduler_output.num_scheduled_tokens[req_id])
+                if seq_len >= req_state.num_tokens:
+                    request_seq_lens.append((i, req_state, seq_len))
+                else:
+                    # Partial request — discard its sampled token.
+                    discard_sampled_tokens_req_indices.append(i)
+
+            req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
+
+            # Materialize previous step's tokens (replaces placeholders).
+            if self._pre_async_results is not None:
+                self._modify_prev_results()
+
+            # Set placeholder for next tokens (advances num_tokens by 1).
+            placeholder_req_id_to_index = self._update_placeholder(
+                discard_sampled_tokens_req_indices, request_seq_lens,
+                scheduler_output, logits_indices_selector,
+                spec_decode_metadata)
+
+            # Non-blocking D2H transfer of current step's tokens.
+            next_tokens = jax.copy_to_host_async(next_tokens)
+            self._pre_async_results = AsyncPreResults(
+                req_ids=req_ids,
+                next_tokens=next_tokens,
+                request_seq_lens=request_seq_lens,
+                discard_sampled_tokens_req_indices=
+                discard_sampled_tokens_req_indices,
+                placeholder_req_id_to_index=placeholder_req_id_to_index,
+                logits_indices_selector=logits_indices_selector,
+                logits_indices=logits_indices_np,
+                scheduler_output=scheduler_output,
+            )
+
+            prompt_logprobs_dict = {req_id: None for req_id in req_ids}
+
+            model_runner_output = ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index=self.input_batch.req_id_to_index.copy(),
+                sampled_token_ids=[],  # Filled in async get_output()
+                logprobs=None,
+                prompt_logprobs_dict=prompt_logprobs_dict,
+                pooler_output=[],
+                kv_connector_output=kv_connector_output,
+            )
+
+            async_model_runner_output = AsyncTPUModelRunnerOutput(
+                model_runner_output,
+                next_tokens,
+                num_reqs,
+                discard_sampled_tokens_req_indices,
+                logits_indices_selector,
+                logits_indices=logits_indices_np,
+                expert_indices=expert_indices,
+                total_num_scheduled_tokens=scheduler_output.
+                total_num_scheduled_tokens,
+                scheduler_output=scheduler_output,
+                req_ids_dp=req_ids_dp,
+                padded_num_scheduled_tokens_per_dp_rank=
+                padded_num_scheduled_tokens_per_dp_rank,
+                runner=self,
+            )
+            self._continue_decode_output = async_model_runner_output
+            return None
+
+        # --- Synchronous path ---
         # Extract relevant tokens on the host using logits_indices.
         # next_tokens has shape (token_batch_size,) — one token per
         # token-padded position.  logits_indices maps each request to its
@@ -1761,8 +1872,6 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         selected_tokens = next_tokens_cpu[logits_indices_cpu]
         if logits_indices_selector is not None:
             selected_tokens = selected_tokens[logits_indices_selector]
-
-        num_reqs = self.input_batch.num_reqs
         sampled_token_ids = []
         for req_idx in range(num_reqs):
             token_id = int(selected_tokens[req_idx])

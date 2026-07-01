@@ -889,11 +889,23 @@ class SpecDecodeMetadata:
 def host_extract_sampled_tokens(
         runner, spec_decode_metadata: Optional[SpecDecodeMetadata],
         sampled_output: jnp.ndarray, logits_indices_selector: np.ndarray,
-        discard_sampled_tokens_req_indices: list, num_reqs: int):
-    """host retrieve the sampled tokens for the current step."""
+        discard_sampled_tokens_req_indices: list, num_reqs: int,
+        logits_indices: Optional[np.ndarray] = None):
+    """host retrieve the sampled tokens for the current step.
+
+    Args:
+        logits_indices: Optional numpy array of position indices.  When the
+            compute path samples ALL token-padded positions (e.g.
+            ``single_step_decode``), this gathers the relevant positions
+            before ``logits_indices_selector`` reordering.  The standard
+            path pre-selects hidden_states and passes ``None`` here.
+    """
     next_tokens = sampled_output
     if spec_decode_metadata is None:
         next_tokens = np.asarray(jax.device_get(next_tokens))
+        # Gather relevant positions (single_step_decode samples all positions).
+        if logits_indices is not None:
+            next_tokens = next_tokens[logits_indices]
         # Map tokens back to the pre-dp shuffling order
         if logits_indices_selector is not None:
             next_tokens = next_tokens[logits_indices_selector]

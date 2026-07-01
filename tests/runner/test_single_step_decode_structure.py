@@ -341,47 +341,57 @@ class TestTpuPlatformValidation(unittest.TestCase):
             "must validate single_step_decode is mutually exclusive with "
             "continue_decode")
 
-    def test_mutually_exclusive_with_async_scheduling(self):
-        """single_step_decode MUST be mutually exclusive with async_scheduling.
+    def test_compatible_with_async_scheduling(self):
+        """single_step_decode IS compatible with async_scheduling.
 
-        ``_execute_single_step_decode`` does not implement the async pattern
+        ``_execute_single_step_decode`` implements the full async protocol
         (``_pre_async_results`` / ``copy_to_host_async`` /
-        ``_modify_prev_results``). Combining single_step_decode with
-        async_scheduling causes stale token substitution on subsequent decode
-        steps (the prefill's next_tokens are re-substituted every step),
-        producing garbled repetitive output. This matches continue_decode's
-        restriction. The restriction will be lifted only when the async
-        pattern is implemented for single_step_decode.
+        ``_modify_prev_results`` / ``_update_placeholder``), overlapping
+        step N's D2H transfer with step N+1's compute. The
+        ``logits_indices`` gathering (needed because single_step samples
+        ALL token-padded positions) is threaded through ``AsyncPreResults``
+        and ``host_extract_sampled_tokens``.
         """
-        # Read raw file content (ast.unparse strips comments).
+        # 1. tpu_platform.py must NOT raise ValueError for async+single_step.
         with open(_TPU_PLATFORM_PATH, "r") as f:
             raw_src = f.read()
-        # Find the single_step_decode validation block.
         ssd_idx = raw_src.find("if enable_single_step_decode:")
         self.assertGreater(ssd_idx, -1,
                            "must have 'if enable_single_step_decode:' block")
-        # Get the block from the if to the next method definition.
         ssd_block = raw_src[ssd_idx:]
-        # The block MUST reference and raise on async_scheduling.
-        self.assertIn(
-            "async_scheduling", ssd_block,
-            "single_step_decode must reference async_scheduling in its "
-            "validation block")
-        self.assertIn(
-            "raise ValueError", ssd_block,
-            "single_step_decode must raise ValueError when async_scheduling "
-            "is enabled")
-        # Confirm the raise is gated on async_scheduling within the block
-        # (cheap textual check that 'async' appears before the next
-        # 'def ' / decorator, which delimits the block).
         block_end = ssd_block.find("\n    @")
         if block_end == -1:
             block_end = ssd_block.find("\n    def ")
         block = ssd_block[:block_end] if block_end > 0 else ssd_block
-        self.assertIn(
-            "async_scheduling", block,
-            "the async_scheduling check must live inside the "
-            "enable_single_step_decode validation block")
+        # The block must reference async_scheduling (as a NOTE, not a raise).
+        self.assertIn("async_scheduling", block,
+                      "single_step_decode validation block must reference "
+                      "async_scheduling")
+        # The block must NOT raise ValueError for async_scheduling.
+        # Check that no 'if async_scheduling:' raise exists.
+        self.assertNotIn(
+            "if async_scheduling:", block,
+            "single_step_decode must NOT raise on async_scheduling — "
+            "the async protocol is implemented")
+
+        # 2. _execute_single_step_decode must implement the async protocol.
+        with open(_TPU_RUNNER_PATH, "r") as f:
+            runner_src = f.read()
+        ssd_fn_idx = runner_src.find("def _execute_single_step_decode")
+        self.assertGreater(ssd_fn_idx, -1,
+                           "_execute_single_step_decode must exist")
+        fn_block = runner_src[ssd_fn_idx:]
+        fn_end = fn_block.find("\n    def ")
+        if fn_end == -1:
+            fn_end = len(fn_block)
+        fn_text = fn_block[:fn_end]
+        for pattern in ["async_scheduling", "_pre_async_results",
+                         "_modify_prev_results", "_update_placeholder",
+                         "copy_to_host_async", "AsyncPreResults",
+                         "AsyncTPUModelRunnerOutput"]:
+            self.assertIn(pattern, fn_text,
+                          f"_execute_single_step_decode must reference "
+                          f"{pattern} for async support")
 
 
 if __name__ == "__main__":
