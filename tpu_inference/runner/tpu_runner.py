@@ -575,6 +575,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             "enable_continue_decode", False)
         self.enable_single_step_decode = self.vllm_config.additional_config.get(
             "enable_single_step_decode", False)
+        self.enable_single_step_prefill = self.vllm_config.additional_config.get(
+            "enable_single_step_prefill", False)
         self.static_max_decode_steps = self.vllm_config.additional_config.get(
             "max_decode_steps", DEFAULT_MAX_DECODE_STEPS)
         self.eos_token_id = runner_utils.get_eos_token_id(self.model_config)
@@ -1238,6 +1240,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         if is_decode_only and self.enable_single_step_decode:
             return self._execute_single_step_decode(scheduler_output)
 
+        if not is_decode_only and self.enable_single_step_prefill:
+            return self._execute_single_step_prefill(scheduler_output)
+
         # TODO(pooyam): I guess we can remove returning sampling_metadata in `_prepare_inputs` after https://github.com/njhill/vllm/commit/b7433ca1a47732394b1bdea4099d98389515954b
         (
             input_ids,
@@ -1878,6 +1883,259 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             sampled_token_ids.append([token_id])
 
             # Update input batch state (mirror standard path).
+            req_id = self.input_batch.req_ids[req_idx]
+            req_state = self.requests.get(req_id)
+            if req_state is not None:
+                start_idx = self.input_batch.num_tokens_no_spec[req_idx]
+                end_idx = start_idx + 1
+                if req_idx < self.max_num_reqs and end_idx <= self.max_model_len:
+                    self.input_batch.token_ids_cpu[
+                        req_idx, start_idx:end_idx] = token_id
+                    self.input_batch.num_tokens_no_spec[req_idx] = end_idx
+                    self.input_batch.num_tokens[req_idx] = end_idx
+                    req_state.output_token_ids.append(token_id)
+
+            if hasattr(attn_metadata,
+                       "seq_lens_cpu") and attn_metadata.seq_lens_cpu is not None:
+                attn_metadata.seq_lens_cpu[req_idx] += 1
+
+        # Handle routed experts (MoE).
+        routed_experts = None
+        if (getattr(self.vllm_config.model_config,
+                    "enable_return_routed_experts", False)
+                and expert_indices is not None):
+            expert_indices_cpu = np.asarray(jax.device_get(expert_indices))
+            routed_experts = _reconstruct_routed_experts(
+                runner=self,
+                scheduler_output=scheduler_output,
+                expert_indices_cpu=expert_indices_cpu,
+                req_ids=self.input_batch.req_ids[:num_reqs],
+                req_ids_dp=req_ids_dp,
+                padded_num_scheduled_tokens_per_dp_rank=
+                padded_num_scheduled_tokens_per_dp_rank,
+            )
+
+        output = ModelRunnerOutput(
+            req_ids=self.input_batch.req_ids[:num_reqs],
+            req_id_to_index=self.input_batch.req_id_to_index.copy(),
+            sampled_token_ids=sampled_token_ids,
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            kv_connector_output=kv_connector_output,
+        )
+
+        if routed_experts is not None:
+            output.routed_experts = routed_experts
+
+        self._continue_decode_output = output
+        return None
+
+    def _execute_single_step_prefill(
+        self,
+        scheduler_output: "VllmSchedulerOutput",
+    ) -> None:
+        """Execute a prefill/mixed step with all 4 dispatches fused into 1 jit.
+
+        Mirrors ``_execute_single_step_decode`` but handles prefill and mixed
+        batches (where requests have multiple tokens).  Reuses the same
+        ``single_step_decode`` jitted function — the fused body (model_fn →
+        compute_logits_fn → sample_fn) is identical for prefill and decode.
+        The only difference is the precompile shapes: ``_precompile_single_step_prefill``
+        compiles for ``num_tokens_paddings`` (up to max_num_batched_tokens)
+        instead of ``num_reqs_paddings``.
+
+        Follows the same proven pattern as single_step_decode: compute logits
+        + sample for ALL token-padded positions, extract relevant tokens on
+        host via ``logits_indices``.  This eliminates 4 separate pjit
+        dispatches (~5ms each) → 1 fused dispatch, attacking the 5.78×
+        prefill TTFT gap.
+
+        Restrictions (enforced in tpu_platform.py):
+        - Not supported with pipeline parallelism
+        - Not supported for multimodal models (text-only)
+        - Not supported with prompt_logprobs
+        - Not supported with speculative decoding
+        - IS compatible with async_scheduling (implements the full async
+          protocol, same as single_step_decode)
+        """
+        if self.is_multimodal_model:
+            raise ValueError(
+                "single_step_prefill is not supported for multimodal models")
+        if self.input_batch.num_prompt_logprobs:
+            raise ValueError(
+                "single_step_prefill is not supported with prompt_logprobs")
+
+        (
+            input_ids,
+            input_positions,
+            attn_metadata,
+            sampling_metadata,
+            logits_indices,
+            spec_decode_metadata,
+            logits_indices_selector,
+            padded_num_reqs,
+            req_ids_dp,
+            padded_num_scheduled_tokens_per_dp_rank,
+        ) = self._prepare_inputs(scheduler_output)
+
+        token_batch_size = input_ids.shape[0]
+
+        # Pad sampling_metadata to token_batch_size (same as single_step_decode).
+        # The fused jit computes logits + samples for ALL token-padded
+        # positions, so sampling_metadata must match.
+        if (sampling_metadata.temperature is not None
+                and token_batch_size != padded_num_reqs):
+            _pad_len = token_batch_size - padded_num_reqs
+            _pad_temp = jnp.full((_pad_len, ), 1.0,
+                                 dtype=sampling_metadata.temperature.dtype)
+            _pad_topk = jnp.zeros((_pad_len, ),
+                                  dtype=sampling_metadata.top_k.dtype)
+            _pad_topp = jnp.ones((_pad_len, ),
+                                 dtype=sampling_metadata.top_p.dtype)
+            sampling_metadata = TPUSupportedSamplingMetadata(
+                temperature=jnp.concatenate(
+                    [sampling_metadata.temperature, _pad_temp]),
+                top_k=jnp.concatenate(
+                    [sampling_metadata.top_k, _pad_topk]),
+                top_p=jnp.concatenate(
+                    [sampling_metadata.top_p, _pad_topp]),
+                _cache_collision_dummy=sampling_metadata.
+                _cache_collision_dummy,
+                do_sampling=sampling_metadata.do_sampling,
+                logprobs=sampling_metadata.logprobs,
+            )
+
+        # Text-only: no multimodal embeddings.
+        input_ids, inputs_embeds = self._get_input_ids_embeds(
+            input_ids, None, None)
+        lora_metadata = self.lora_utils.extract_lora_metadata()
+
+        # Split RNG for sampling (mirrors standard path in _sample_from_logits).
+        if sampling_metadata.do_sampling:
+            self.rng_params_for_sampling, step_rng = jax.random.split(
+                self.rng_params_for_sampling)
+        else:
+            step_rng = self.rng_params_for_sampling
+
+        from tpu_inference.layers.jax.sample.sampling import sample
+
+        with self.maybe_forbid_compile, \
+             set_forward_context(None, self.vllm_config), \
+             self.maybe_get_kv_connector_output(
+                 scheduler_output) as kv_connector_output:
+            kv_caches, next_tokens, expert_indices = single_step_decode(
+                state=self.state_leaves,
+                kv_caches=self.kv_caches,
+                rng=step_rng,
+                input_ids=input_ids,
+                attn_metadata=attn_metadata,
+                input_positions=input_positions,
+                sampling_metadata=sampling_metadata,
+                inputs_embeds=inputs_embeds,
+                lora_metadata=lora_metadata,
+                intermediate_tensors=None,
+                model_fn=getattr(self.model, "step_fn_no_options",
+                                 self.model_fn),
+                compute_logits_fn=self.compute_logits_fn,
+                sample_fn=sample,
+                mesh=self.mesh,
+                layer_name_to_kvcache_index=tuple(
+                    self.layer_name_to_kvcache_index.items()),
+                is_first_rank=self.is_first_rank,
+                is_last_rank=self.is_last_rank,
+            )
+
+        self.kv_caches = kv_caches
+
+        num_reqs = self.input_batch.num_reqs
+
+        # --- Async scheduling path ---
+        # Same protocol as _execute_single_step_decode.  See that method
+        # for detailed documentation on the async 2-step pipeline.
+        if self.scheduler_config.async_scheduling:
+            logits_indices_np = np.asarray(jax.device_get(logits_indices))
+
+            request_seq_lens: list[tuple[int, CachedRequestState, int]] = []
+            discard_sampled_tokens_req_indices = []
+            for i, req_id in zip(range(num_reqs),
+                                 self.input_batch.req_ids):
+                assert req_id is not None
+                req_state = self.requests[req_id]
+                seq_len = (req_state.num_computed_tokens +
+                           scheduler_output.num_scheduled_tokens[req_id])
+                if seq_len >= req_state.num_tokens:
+                    request_seq_lens.append((i, req_state, seq_len))
+                else:
+                    # Partial request (chunked prefill) — discard its token.
+                    discard_sampled_tokens_req_indices.append(i)
+
+            req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])
+
+            if self._pre_async_results is not None:
+                self._modify_prev_results()
+
+            placeholder_req_id_to_index = self._update_placeholder(
+                discard_sampled_tokens_req_indices, request_seq_lens,
+                scheduler_output, logits_indices_selector,
+                spec_decode_metadata)
+
+            next_tokens = jax.copy_to_host_async(next_tokens)
+            self._pre_async_results = AsyncPreResults(
+                req_ids=req_ids,
+                next_tokens=next_tokens,
+                request_seq_lens=request_seq_lens,
+                discard_sampled_tokens_req_indices=
+                discard_sampled_tokens_req_indices,
+                placeholder_req_id_to_index=placeholder_req_id_to_index,
+                logits_indices_selector=logits_indices_selector,
+                logits_indices=logits_indices_np,
+                scheduler_output=scheduler_output,
+            )
+
+            prompt_logprobs_dict = {req_id: None for req_id in req_ids}
+
+            model_runner_output = ModelRunnerOutput(
+                req_ids=req_ids,
+                req_id_to_index=self.input_batch.req_id_to_index.copy(),
+                sampled_token_ids=[],
+                logprobs=None,
+                prompt_logprobs_dict=prompt_logprobs_dict,
+                pooler_output=[],
+                kv_connector_output=kv_connector_output,
+            )
+
+            async_model_runner_output = AsyncTPUModelRunnerOutput(
+                model_runner_output,
+                next_tokens,
+                num_reqs,
+                discard_sampled_tokens_req_indices,
+                logits_indices_selector,
+                logits_indices=logits_indices_np,
+                expert_indices=expert_indices,
+                total_num_scheduled_tokens=scheduler_output.
+                total_num_scheduled_tokens,
+                scheduler_output=scheduler_output,
+                req_ids_dp=req_ids_dp,
+                padded_num_scheduled_tokens_per_dp_rank=
+                padded_num_scheduled_tokens_per_dp_rank,
+                runner=self,
+            )
+            self._continue_decode_output = async_model_runner_output
+            return None
+
+        # --- Synchronous path ---
+        # Extract relevant tokens on the host using logits_indices.
+        next_tokens_cpu = np.asarray(jax.device_get(next_tokens))
+        logits_indices_cpu = np.asarray(jax.device_get(logits_indices))
+        selected_tokens = next_tokens_cpu[logits_indices_cpu]
+        if logits_indices_selector is not None:
+            selected_tokens = selected_tokens[logits_indices_selector]
+        sampled_token_ids = []
+        for req_idx in range(num_reqs):
+            token_id = int(selected_tokens[req_idx])
+            sampled_token_ids.append([token_id])
+
             req_id = self.input_batch.req_ids[req_idx]
             req_state = self.requests.get(req_id)
             if req_state is not None:

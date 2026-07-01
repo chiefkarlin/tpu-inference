@@ -269,6 +269,9 @@ class CompilationManager:
                 if self.runner.enable_single_step_decode:
                     self._precompile_single_step_decode()
                     self._flush_compilations()
+                if self.runner.enable_single_step_prefill:
+                    self._precompile_single_step_prefill()
+                    self._flush_compilations()
         finally:
             self._finalize_compilation()
         elapsed = time.perf_counter() - compilation_start_time
@@ -1947,4 +1950,184 @@ class CompilationManager:
                 self.runner.is_first_rank,
                 self.runner.is_last_rank,
                 warmup_handler=single_step_warmup,
+            )
+
+    def _precompile_single_step_prefill(self) -> None:
+        """Precompile the single_step_decode fused dispatch for prefill shapes.
+
+        Mirrors ``_precompile_single_step_decode`` but iterates
+        ``num_tokens_paddings`` (up to max_num_batched_tokens) instead of
+        ``num_reqs_paddings``.  This compiles the SAME ``single_step_decode``
+        jitted function for the larger token batch shapes that prefill
+        produces.  Without this, the first prefill would compile at runtime
+        under ``maybe_forbid_compile``.
+        """
+        logger.info("Precompiling single_step_prefill fused dispatch.")
+        dp_size = self.runner.vllm_config.sharding_config.total_dp_size
+        dp_sharding = NamedSharding(
+            self.runner.mesh, PartitionSpec(ShardingAxisName.ATTN_DATA, ))
+
+        # Greedy sampling metadata for precompilation.
+        _cache_collision_dummy = jnp.zeros((2, ), dtype=jnp.int32)
+        _cache_collision_dummy = device_array(self.runner.mesh,
+                                              _cache_collision_dummy)
+        sampling_metadata = TPUSupportedSamplingMetadata(
+            temperature=None,
+            top_k=None,
+            top_p=None,
+            _cache_collision_dummy=_cache_collision_dummy,
+            do_sampling=False,
+            logprobs=False)
+
+        # Iterate over token-padded shapes (up to max_num_batched_tokens).
+        # Prefill batches have num_tokens >> num_reqs, so we need the
+        # larger shapes compiled.
+        for num_tokens in self.runner.num_tokens_paddings:
+            init_tokens = self._create_dummy_tensor((num_tokens, ),
+                                                     jnp.int32, dp_sharding)
+            input_positions = self._create_dummy_tensor((num_tokens, ),
+                                                         jnp.int32,
+                                                         dp_sharding)
+
+            seq_lens = self._create_dummy_tensor(
+                (self.runner.max_num_reqs, ), jnp.int32, dp_sharding)
+            query_start_loc = self._create_dummy_tensor(
+                (self.runner.max_num_reqs + dp_size, ), jnp.int32, dp_sharding)
+
+            request_distribution = np.array([0, 0, 0] * dp_size,
+                                             dtype=np.int32)
+            request_distribution = device_array(self.runner.mesh,
+                                                 request_distribution,
+                                                 sharding=dp_sharding)
+
+            if self.runner.kv_cache_config.has_mamba_layers:
+                mamba_state_indices = device_array(
+                    self.runner.mesh,
+                    np.zeros(self.runner.max_num_reqs, dtype=np.int32),
+                    sharding=dp_sharding)
+            else:
+                mamba_state_indices = None
+
+            def build_block_table(kv_cache_gid: int) -> jax.Array:
+                block_table_obj = self.runner.input_batch.block_table[
+                    kv_cache_gid]
+                shape = (self.runner.max_num_reqs,
+                         block_table_obj.max_num_blocks_per_req)
+                block_tables = np.zeros(shape, dtype=np.int32)
+                block_tables = block_tables.reshape(-1)
+                block_tables = device_array(self.runner.mesh,
+                                            block_tables,
+                                            sharding=dp_sharding)
+                return block_tables
+
+            # Use a representative padded_num_reqs for this token bucket.
+            # The exact value doesn't affect compilation since
+            # padded_num_reqs is a meta_field (static arg) that controls
+            # GDN slicing.  We use the max_num_reqs as a safe default.
+            attn_padded_num_reqs = self.runner.max_num_reqs
+
+            if len(self.runner.kv_cache_config.kv_cache_groups) <= 1:
+                no_kv_cache = len(
+                    self.runner.kv_cache_config.kv_cache_groups) == 0
+                block_tables = build_block_table(
+                    0) if not no_kv_cache else None
+                attn_metadata = AttentionMetadata(
+                    input_positions=input_positions,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                    query_start_loc=query_start_loc,
+                    request_distribution=request_distribution,
+                    mamba_state_indices=mamba_state_indices,
+                    padded_num_reqs=attn_padded_num_reqs,
+                )
+            else:
+                attn_metadata = {
+                    name:
+                    AttentionMetadata(
+                        input_positions=input_positions,
+                        block_tables=build_block_table(gid),
+                        seq_lens=seq_lens,
+                        query_start_loc=query_start_loc,
+                        request_distribution=request_distribution,
+                        mamba_state_indices=mamba_state_indices,
+                        padded_num_reqs=attn_padded_num_reqs,
+                    )
+                    for gid, kv_cache_group in enumerate(
+                        self.runner.kv_cache_config.kv_cache_groups)
+                    for name in kv_cache_group.layer_names
+                }
+
+            lora_metadata = self.runner.lora_utils.extract_lora_metadata()
+
+            def single_step_prefill_wrapper(
+                state,
+                model_fn,
+                compute_logits_fn,
+                sample_fn,
+                mesh,
+                kv_caches,
+                rng,
+                input_ids,
+                attn_metadata,
+                input_positions,
+                sampling_metadata,
+                inputs_embeds,
+                lora_metadata,
+                intermediate_tensors,
+                layer_name_to_kvcache_index,
+                is_first_rank,
+                is_last_rank,
+            ):
+                final_kv_caches, next_tokens, expert_indices = \
+                    single_step_decode(
+                        state=state,
+                        kv_caches=kv_caches,
+                        rng=rng,
+                        input_ids=input_ids,
+                        attn_metadata=attn_metadata,
+                        input_positions=input_positions,
+                        sampling_metadata=sampling_metadata,
+                        inputs_embeds=inputs_embeds,
+                        lora_metadata=lora_metadata,
+                        intermediate_tensors=intermediate_tensors,
+                        model_fn=model_fn,
+                        compute_logits_fn=compute_logits_fn,
+                        sample_fn=sample_fn,
+                        mesh=mesh,
+                        layer_name_to_kvcache_index=
+                        layer_name_to_kvcache_index,
+                        is_first_rank=is_first_rank,
+                        is_last_rank=is_last_rank,
+                    )
+                self.runner.kv_caches = final_kv_caches
+                return next_tokens
+
+            def single_step_prefill_warmup(_fn, _args, _call_kwargs):
+                new_args = list(_args)
+                new_args[5] = self.runner.kv_caches
+                return _fn(*new_args, **_call_kwargs)
+
+            self._run_compilation(
+                f"worker{self.runner.rank} "
+                f"single_step_prefill_tokens_{num_tokens}",
+                single_step_prefill_wrapper,
+                self.runner.state_leaves,
+                getattr(self.runner.model, "step_fn_no_options",
+                        self.runner.model_fn),
+                self.runner.compute_logits_fn,
+                sample,
+                self.runner.mesh,
+                self.runner.kv_caches,
+                self.runner.rng_params_for_sampling,
+                init_tokens,
+                attn_metadata,
+                input_positions,
+                sampling_metadata,
+                None,  # inputs_embeds
+                lora_metadata,
+                None,  # intermediate_tensors
+                tuple(self.runner.layer_name_to_kvcache_index.items()),
+                self.runner.is_first_rank,
+                self.runner.is_last_rank,
+                warmup_handler=single_step_prefill_warmup,
             )

@@ -370,6 +370,8 @@ class TpuPlatform(Platform):
             "enable_continue_decode", False)
         enable_single_step_decode = vllm_config.additional_config.get(
             "enable_single_step_decode", False)
+        enable_single_step_prefill = vllm_config.additional_config.get(
+            "enable_single_step_prefill", False)
         is_pooling_model = vllm_config.model_config.runner_type == "pooling"
         async_scheduling = vllm_config.scheduler_config.async_scheduling
 
@@ -424,6 +426,33 @@ class TpuPlatform(Platform):
             # path, and sets num_lookahead_tokens in Scheduler.__init__.
             # Without this patch, the scheduler processes fused-decode
             # outputs incorrectly, producing garbled tokens.
+            from tpu_inference.core.sched.utils import \
+                patch_vllm_scheduler_for_continue_decode
+            patch_vllm_scheduler_for_continue_decode()
+
+        if enable_single_step_prefill:
+            if parallel_config.pipeline_parallel_size > 1:
+                raise ValueError(
+                    "single_step_prefill is not supported with pipeline "
+                    "parallelism")
+            if is_pooling_model:
+                raise ValueError(
+                    "single_step_prefill is not supported for pooling models")
+            if vllm_config.speculative_config is not None:
+                raise ValueError(
+                    "single_step_prefill is not supported with speculative "
+                    "decoding")
+            # NOTE: single_step_prefill IS compatible with async_scheduling.
+            # _execute_single_step_prefill implements the full async protocol
+            # (same as single_step_decode), overlapping step N's D2H transfer
+            # with step N+1's compute.
+            # NOTE: single_step_prefill handles prefill and mixed batches
+            # (non-decode-only).  When combined with single_step_decode, the
+            # two cover all batch types: decode-only → single_step_decode,
+            # prefill/mixed → single_step_prefill.  Both reuse the same
+            # single_step_decode jitted function (different precompiled shapes).
+
+            # Apply the same scheduler patch as continue_decode.
             from tpu_inference.core.sched.utils import \
                 patch_vllm_scheduler_for_continue_decode
             patch_vllm_scheduler_for_continue_decode()
