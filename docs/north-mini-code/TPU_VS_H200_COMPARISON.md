@@ -1,8 +1,57 @@
 # NMC TPU v7x vs H200 GPU — Benchmark Comparison
 
-**Date:** 2026-06-30
+**Date:** 2026-06-30 (updated 2026-07-01 with async_scheduling results)
 **Model:** CohereLabs/North-Mini-Code-1.0 (30.48B params, BF16, MoE 128/8)
 **Method:** vllm bench serve with synthetic random data, --ignore-eos, identical benchmark script
+
+---
+
+## UPDATED RESULTS — async_scheduling optimization (2026-07-01)
+
+Adding `--async-scheduling` to the TPU deployment (flag-only change, no code change) produced significant gains by overlapping D2H transfer with forward dispatch.
+
+### Prefill TTFT (async_scheduling vs Config B vs H200)
+
+| Input Length | Config B TTFT | async_scheduling TTFT | H200 TTFT | async/H200 gap |
+|-------------|--------------|----------------------|-----------|----------------|
+| 128 | 19.7ms | 20.7ms | 7.0ms | 2.96× |
+| 512 | 33.8ms | 38.1ms | 8.4ms | 4.54× |
+| 1024 | 42.4ms | 55.4ms | 9.2ms | 6.02× |
+| 2048 | 77.2ms | 92.2ms | 11.9ms | 7.75× |
+| 4096 | 150.8ms | 102.2ms | 17.7ms | 5.78× |
+
+*Note: async_scheduling TTFT at 4096 improved 32% (151→102ms), but shorter inputs show slight regression due to async scheduling overhead. H200 prefill remains significantly faster.*
+
+### Decode Throughput Scaling (async_scheduling vs Config B vs H200)
+
+| Concurrency | Config B output | async output | async improvement | H200 output | async/H200 gap |
+|-------------|----------------|-------------|-------------------|-------------|----------------|
+| 1 | 153 tok/s | 167 tok/s | +9% | 257 tok/s | 1.54× |
+| 2 | 280 tok/s | 313 tok/s | +12% | 471 tok/s | 1.51× |
+| 4 | 531 tok/s | 604 tok/s | +14% | 902 tok/s | 1.49× |
+| 8 | 1,003 tok/s | 1,196 tok/s | +19% | 1,675 tok/s | 1.40× |
+| 16 | 1,676 tok/s | 2,268 tok/s | +35% | 3,189 tok/s | 1.41× |
+| 32 | 2,233 tok/s | 3,935 tok/s | +76% | 5,575 tok/s | 1.42× |
+
+### Summary: async_scheduling Impact
+
+| Metric | Config B | async_scheduling | Improvement | H200 | Gap (was→now) |
+|--------|---------|-----------------|-------------|------|----------------|
+| Single-stream decode | 153 tok/s | 167 tok/s | +9% | 257 tok/s | 1.68×→1.54× |
+| c8 output | 1,003 tok/s | 1,196 tok/s | +19% | 1,675 tok/s | 1.67×→1.40× |
+| c16 output | 1,676 tok/s | 2,268 tok/s | +35% | 3,189 tok/s | 1.90×→1.41× |
+| c32 output | 2,233 tok/s | 3,935 tok/s | +76% | 5,575 tok/s | 2.50×→1.42× |
+| Prefill TTFT @4096 | 151ms | 102ms | -32% | 18ms | 8.39×→5.78× |
+
+**Key findings:**
+- async_scheduling closes the decode throughput gap from 1.5-2.5× to **1.40-1.54×** across all batch sizes
+- Biggest win at c32: +76% output throughput (2,233→3,935 tok/s), gap narrowed from 2.50× to 1.42×
+- Prefill TTFT at 4096 improved 32% (151→102ms) — async overlap helps long prefills
+- The remaining gap (1.4× decode, 5.8× prefill) is XLA runtime dispatch overhead that async_scheduling can only partially overlap
+
+---
+
+## ORIGINAL RESULTS — Config B baseline (2026-06-30)
 
 ---
 
