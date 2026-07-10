@@ -11,7 +11,7 @@
 
 **Verdict: No accuracy degradation. The TPU port maintains quality parity with the H200 GPU baseline.**
 
-The three fused dispatch optimizations on TPU (`async_scheduling` + `single_step_decode` + `single_step_prefill`) preserve model quality. Token-level divergences exist due to BF16 numerical differences between TPU and GPU hardware, but these are hardware-level numerical noise — not regressions from kernel fusion. Task accuracy is preserved across both math reasoning (GSM8K) and code generation (HumanEval).
+The three fused dispatch optimizations on TPU (`async_scheduling` + `single_step_decode` + `single_step_prefill`) preserve model quality. Token-level divergences exist due to BF16 numerical differences between TPU and GPU hardware, but these are hardware-level numerical noise — not regressions from kernel fusion. Task accuracy is preserved across math reasoning (GSM8K), code generation (HumanEval), and general knowledge (MMLU, 57 subjects, 14k questions).
 
 ---
 
@@ -116,6 +116,28 @@ The 3 mismatches are all on degenerate repetitive outputs from nonsensical rando
 - **Agreement: 151/164 (92.1%)**
 - TPU scored higher — net +7 problems (10 TPU-only passes vs 3 H200-only passes)
 
+### 4. MMLU (General Knowledge)
+
+- **14,042 questions across 57 subjects, 5-shot, temperature=0, max_gen_toks=10**
+- Tool: `lm_eval` 0.4.12 (`local-completions` model), task: `mmlu_llama`
+
+| Metric | H200 (baseline) | TPU | Diff |
+|---|---|---|---|
+| mmlu_llama (overall) | 0.7530 ± 0.0035 | 0.7553 ± 0.0034 | +0.0023 (within stderr) |
+| humanities | 0.6814 ± 0.0065 | 0.6844 ± 0.0064 | +0.003 |
+| other | 0.7918 ± 0.0070 | 0.7947 ± 0.0070 | +0.003 |
+| social sciences | 0.8570 ± 0.0062 | 0.8573 ± 0.0062 | +0.000 |
+| stem | 0.7203 ± 0.0077 | 0.7228 ± 0.0076 | +0.003 |
+
+**Per-sample analysis** (14,015 matched samples):
+- Responses differ (token-level): 503/14,015 (3.6%)
+- Both correct: 10,380 (74.1%)
+- Both wrong: 3,256 (23.2%)
+- TPU only correct: 206
+- H200 only correct: 173
+- **Agreement: 13,636/14,015 (97.3%)**
+- TPU scored higher — net +33 questions
+
 ---
 
 ## Methodology
@@ -141,9 +163,10 @@ The 3 mismatches are all on degenerate repetitive outputs from nonsensical rando
 |---|---|
 | Math reasoning (GSM8K) | Parity confirmed (-0.01 strict diff, within stderr) |
 | Code generation (HumanEval) | Parity confirmed (+0.043 pass@1, within stderr, TPU slightly higher) |
+| General knowledge (MMLU) | Parity confirmed (+0.0023 overall, within stderr, TPU slightly higher) |
 | Token-level determinism | 15% divergence on random prompts — expected BF16 hardware noise |
-| Per-sample agreement | GSM8K 96%, HumanEval 92.1% |
+| Per-sample agreement | GSM8K 96%, HumanEval 92.1%, MMLU 97.3% |
 | Semantic correctness | Preserved across all tested tasks |
 | Kernel fusion regression | None detected |
 
-The TPU port of North-Mini-Code with `async_scheduling` + `single_step_decode` + `single_step_prefill` is validated for production use with no quality regression. The residual token-level divergence is attributable to BF16 numerical differences between TPU and GPU hardware, not to the fusion optimizations.
+The TPU port of North-Mini-Code with `async_scheduling` + `single_step_decode` + `single_step_prefill` is validated for production use with no quality regression. Across three benchmarks spanning 14,306 total questions — math reasoning, code generation, and general knowledge — TPU accuracy matches or marginally exceeds the H200 GPU baseline within statistical noise. The residual token-level divergence is attributable to BF16 numerical differences between TPU and GPU hardware, not to the fusion optimizations.
