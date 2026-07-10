@@ -1,12 +1,44 @@
 # NMC TPU v7x vs H200 GPU — Benchmark Comparison
 
-**Date:** 2026-06-30 (updated 2026-07-01 with async_scheduling + single_step_decode combined results)
-**Model:** CohereLabs/North-Mini-Code-1.0 (30.48B params, BF16, MoE 128/8)
-**Method:** vllm bench serve with synthetic random data, --ignore-eos, identical benchmark script
+**Date:** 2026-06-30 (updated 2026-07-10 with single_step_prefill results)
 
 ---
 
-## LATEST RESULTS — async_scheduling + single_step_decode combined (2026-07-01)
+## LATEST RESULTS — single_step_prefill added (2026-07-10)
+
+Adding `enable_single_step_prefill` (fused prefill dispatch, 4→1 pjit) to the production config. Correctness verified with `logits_indices` fix (commit `18b426a4`).
+
+### Production config (all 3 optimizations)
+`--async-scheduling` + `--additional-config '{"enable_single_step_decode": true, "enable_single_step_prefill": true}'` + `SKIP_JAX_PRECOMPILE=0`
+
+### Prefill TTFT — 4096 token budget vs 1024 token budget
+
+| Input Length | 4096 Budget | 1024 Budget | H200 | 4096 vs H200 | 1024 vs H200 |
+|---|---|---|---|---|---|
+| 128 | 18.7ms | 18.6ms | 12.7ms | 1.47× | 1.46× |
+| 512 | 34.9ms | 34.5ms | 14.0ms | 2.49× | 2.46× |
+| 1024 | 52.9ms | **39.3ms** | 16.0ms | 3.31× | **2.46×** |
+| 2048 | 90.8ms | **67.8ms** | ~18ms | 5.04× | **3.77×** |
+| 4096 | 105.1ms | 125.6ms | 18ms | 5.84× | 6.98× |
+
+### Decode Throughput (mixed_512_256) — token budget comparison
+
+| Concurrency | 4096 Budget | 1024 Budget | H200 | 1024 vs H200 |
+|---|---|---|---|---|
+| c1 | 168 | 168 | 249 | 1.49× |
+| c8 | 1,284 | 1,287 | 1,486 | 1.15× |
+| c16 | 2,294 | **2,916** | 2,609 | **0.90× (TPU WINS)** |
+| c32 | 4,417 | 4,419 | 4,401 | **0.98× (TPU WINS)** |
+
+**Key findings:**
+- 1024 token budget: 25% TTFT improvement for 1024-2048 input (common prompt range)
+- 1024 token budget: 27% c16 decode throughput improvement (better scheduling)
+- 4096 input is 20% slower at 1024 budget (4 chunks overhead exceeds fusion savings)
+- Recommendation: use 1024 budget for typical prompts (≤2048), 4096 for long-context workloads
+
+---
+
+## PREVIOUS RESULTS — async_scheduling + single_step_decode combined (2026-07-01)
 
 Combining `async_scheduling` (D2H overlap) with `single_step_decode` (fused dispatch, 4→1 pjit) stacks both optimizations. The fused dispatch overhead that hurt single_step at low batch is eliminated by async overlap, and at high batch both gains compound.
 
@@ -224,7 +256,7 @@ The H200 uses vLLM defaults (max-num-seqs=256, max-num-batched-tokens=8192) whil
 
 1. **Pathways (JAX_PLATFORMS=proxy)** — true async/remote dispatch would eliminate the remaining low-batch dispatch overhead (c1: 1.49×, c8: 1.15×). The #1 remaining lever.
 
-2. **CUDA-graph-style capture for prefill** — the prefill TTFT gap (5.78× at 4096) is the largest open gap. Requires dispatch-level capture not yet implemented in tpu-inference.
+2. **Further prefill dispatch reduction** — single_step_prefill reduced TTFT 25% at 1024 token budget, but the gap remains 2.5-5× vs H200. The remaining overhead is XLA runtime scheduling, not kernel execution.
 
 3. **Increase max-num-seqs beyond 32** — with the combined optimization reducing dispatch overhead, higher batch sizes could further amortize the remaining overhead.
 

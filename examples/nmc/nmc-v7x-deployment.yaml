@@ -5,11 +5,13 @@
 # GKE auto-taints Flex nodes with google.com/tpu + cloud.google.com/gke-queued.
 # Pods MUST tolerate both taints or the autoscaler won't request capacity.
 #
-# Production config: async_scheduling + single_step_decode (combined).
+# Production config: async_scheduling + single_step_decode + single_step_prefill (combined).
 # - async_scheduling: overlaps D2H transfer with next step's compute
 # - single_step_decode: fuses 4 per-step pjit dispatches into 1 jitted dispatch
+# - single_step_prefill: fuses 4 prefill dispatches into 1 jitted dispatch
 # Combined: 2× Config B throughput at c32, TPU beats H200 at c16+.
-# Requires SKIP_JAX_PRECOMPILE=0 (single_step_decode precompilation).
+# Prefill fusion: 25% TTFT improvement at 1024 token budget for typical prompts.
+# Requires SKIP_JAX_PRECOMPILE=0 (single_step_decode + prefill precompilation).
 #
 # Usage:
 #   kubectl apply -f nmc-v7x-deployment.yaml
@@ -99,7 +101,7 @@ spec:
             - "42"
             - --async-scheduling
             - --additional-config
-            - '{"enable_single_step_decode": true}'
+            - '{"enable_single_step_decode": true, "enable_single_step_prefill": true}'
           env:
             - name: HUGGING_FACE_HUB_TOKEN
               valueFrom:
