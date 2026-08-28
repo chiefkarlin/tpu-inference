@@ -212,7 +212,15 @@ class WarmupPlan:
         omitted = set(self.leave_unwarmed)
         return [b for b in self.window_buckets if b not in omitted]
 
-    def negative_control(self) -> Optional[common.NegativeControl]:
+    def negative_control(self, *,
+                         executed: bool = False) -> Optional[common.NegativeControl]:
+        """The control descriptor. ``executed`` says whether it actually RAN.
+
+        It used to be hardcoded ``False`` here, which made the field incapable
+        of ever recording a fired control -- and "has this control ever fired?"
+        is exactly the question round 1 R9/R11 turn on. A plan is rendered
+        unexecuted; evidence evaluated from a real corrupted run is not.
+        """
         if not self.leave_unwarmed:
             return None
         return common.NegativeControl(
@@ -222,7 +230,7 @@ class WarmupPlan:
                          "window still uses them"),
             expected_effect=("the window compiles in-flight, the recompilation counter "
                              "advances, and the window is marked VOID"),
-            executed=False)
+            executed=executed)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -423,6 +431,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     Neither mode runs a model. The warm-up pass itself is issued by the harness
     that owns the engine, through :class:`WarmupLedger`.
+
+    EXIT STATUS. Three states, never two:
+
+    * ``0`` -- ran, and the window is VALID.
+    * ``1`` -- ran, and the window is not VALID (VOID or UNDETERMINED). A
+      verdict was reached and it was not a pass.
+    * ``2`` -- COULD NOT RUN. Thresholds unreadable, evidence file missing or
+      not JSON. Nothing was assessed and no verdict exists.
+
+    An operator who cannot tell "never ran" from "ran and stopped the run" has
+    no instrument, so ``2`` is reserved for the former and is never a verdict.
+    Note that UNDETERMINED is a verdict -- the instrument ran and reported that
+    the evidence does not decide -- which is why it is ``1`` and not ``2``.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="mode", required=True)
@@ -453,8 +474,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"M0: warm-up plan written to {args.out}")
         return 0
 
-    thresholds = common.Thresholds.load(args.thresholds)
-    evidence = evidence_from_dict(common.load_json(args.evidence))
+    # P4-class, M0 instance. Both of these used to escape as tracebacks, and an
+    # uncaught exception leaves Python with exit status 1 -- the same status a
+    # VOID window leaves. "The evidence file is not there" and "the window is
+    # void" are not the same fact and must not be the same code.
+    try:
+        thresholds = common.Thresholds.load(args.thresholds)
+    except (OSError, ValueError, common.ThresholdError) as exc:
+        print(f"M0: could not load thresholds: {exc}", file=sys.stderr)
+        return 2
+    try:
+        evidence = evidence_from_dict(common.load_json(args.evidence))
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f"M0: could not read evidence {args.evidence!r}: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
     try:
         checks = evaluate_window(evidence, thresholds)
     except common.ThresholdError as exc:
@@ -468,7 +502,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                           payload=payload,
                           checks=checks,
                           thresholds=thresholds,
-                          negative_control=evidence.plan.negative_control())
+                          # This path evaluates evidence from a run that really
+                          # happened, so a control present here DID fire.
+                          negative_control=evidence.plan.negative_control(
+                              executed=True))
     print(f"M0: window is {verdict.value}; artifact written to {args.out}")
     for item in checks:
         print(f"  {item.name}: {item.outcome.value} -- {item.reason}")

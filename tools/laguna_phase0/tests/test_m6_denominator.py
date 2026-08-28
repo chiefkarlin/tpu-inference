@@ -212,3 +212,33 @@ def test_tensor_parallel_ceiling_is_enforced():
     ceiling = int(th.require("m6.max_tensor_parallel_size"))
     assert m6.check_tensor_parallel(ceiling * 2, ceiling).outcome is common.Outcome.FAILED
     assert m6.check_tensor_parallel(None, ceiling).outcome is common.Outcome.UNDETERMINED
+
+
+# --------------------------------------------------------------------------
+# P3, M6 half. See the note in test_m0_warm_cache.py: the M0 half is routed
+# through the real producer. THIS HALF IS NOT, and the reason is worth stating
+# rather than hiding. M6's producer is `m6.main()`, whose first act is
+# `device_views_from_jax()`, which imports jax. There is no jax here and no
+# package manager, so main() cannot be reached offline yet. P2 adds the offline
+# path; the producer-routed leg for M6 lands there, and until it does the two
+# tests below show only that the descriptor can carry the value -- NOT that the
+# producer will ever emit it.
+# --------------------------------------------------------------------------
+
+
+def test_the_m6_control_descriptor_can_record_a_firing():
+    injection = m6.Injection(inconsistent_pairing=True)
+    control = injection.as_negative_control(executed=True)
+    assert control is not None and control.executed is True
+
+
+def test_the_m6_control_descriptor_defaults_to_not_executed():
+    """The empty-case leg: True must not be unconditional."""
+    injection = m6.Injection(inconsistent_pairing=True)
+    control = injection.as_negative_control()
+    assert control is not None and control.executed is False
+
+
+def test_an_inactive_injection_has_no_control_even_when_told_it_executed():
+    """`executed=True` must not conjure a control out of an uncorrupted run."""
+    assert m6.Injection().as_negative_control(executed=True) is None

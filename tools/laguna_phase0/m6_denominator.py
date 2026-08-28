@@ -205,7 +205,14 @@ class Injection:
         return (self.chip_count_scale is not None or self.inconsistent_pairing
                 or self.consistent_redenomination)
 
-    def as_negative_control(self) -> Optional[common.NegativeControl]:
+    def as_negative_control(self, *,
+                            executed: bool = False) -> Optional[common.NegativeControl]:
+        """The control descriptor. ``executed`` says whether it actually RAN.
+
+        Hardcoded ``False`` until round 1: the field that answers "has this
+        control ever fired?" -- R9's whole subject, and R11's -- could not
+        record a firing even after one.
+        """
         if not self.active():
             return None
         legs = []
@@ -221,7 +228,7 @@ class Injection:
             expected_effect=("M6 fails the run on legs 1 and 2. Under a consistent "
                              "re-denomination the ridge is unchanged and the pairing "
                              "check passes, which is the finding, not a defect."),
-            executed=False)
+            executed=executed)
 
     def apply_to_basis(self, basis: RooflineBasis) -> RooflineBasis:
         flops, bandwidth = basis.dense_bf16_tflops, basis.hbm_bandwidth_gbytes_per_s
@@ -570,7 +577,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                           payload=report.payload(),
                           checks=report.checks,
                           thresholds=thresholds,
-                          negative_control=injection.as_negative_control(),
+                          # Reached only after assert_denominator returned, and
+                          # assert_denominator is where the injection is applied
+                          # (basis at line 487, chip count at 494). So on this
+                          # path an ACTIVE injection has by construction already
+                          # run, and `executed` says so. `as_negative_control`
+                          # still returns None when the injection is inactive,
+                          # so this cannot claim a firing that did not happen.
+                          negative_control=injection.as_negative_control(
+                              executed=True),
                           extra_provenance={"env": common.env_snapshot(RECORDED_ENV)})
     print(f"M6: {report.outcome.value}; artifact written to {args.out}")
     for item in report.checks:
