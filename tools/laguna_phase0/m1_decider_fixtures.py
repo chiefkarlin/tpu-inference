@@ -533,6 +533,125 @@ def tally(records: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
     return counts
 
 
+# --------------------------------------------------------------------------
+# Proving the harness can fail.
+#
+# Twenty-four green lines are not evidence that the decider is right. They are
+# equally consistent with a comparison harness that returns PASSED whatever it
+# is handed, and that failure mode is invisible precisely when everything is
+# passing. So before the green run is reported, the decider is deliberately
+# broken in ways the fixtures are supposed to catch, and the fixtures are
+# required to go red. A mutation that the suite does not notice is a hole in
+# the suite, reported as such.
+#
+# The mutants are the mistakes most likely to be made for real: an inclusive
+# cut written as a strict one, a threshold borrowed for a quantity nobody set
+# one for, and a same-run requirement quietly dropped.
+# --------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class Mutation:
+    name: str
+    why: str
+    attribute: str
+    build: Callable[[Any], Any]
+    fixtures_that_must_fail: Sequence[str]
+
+
+def _mutant_strict_cuts(_original):
+    def classify(f_host, holds_at, refuted_at):
+        if f_host > holds_at:
+            return m1.HostBoundVerdict.HOLDS
+        if f_host < refuted_at:
+            return m1.HostBoundVerdict.REFUTED
+        return m1.HostBoundVerdict.MIXED
+
+    return classify
+
+
+def _mutant_closure_borrows_a_threshold(_original):
+    def check_closure(derivations, thresholds):
+        worst_residual = max((abs(d.unattributed_fraction) for d in derivations),
+                             default=0.0)
+        return common.check(
+            "m1.closure_residual",
+            common.Outcome.PASSED if worst_residual < 0.6 else common.Outcome.FAILED,
+            "residual within a threshold this mutant invented",
+            {"worst_residual": worst_residual})
+
+    return check_closure
+
+
+def _mutant_rule2_ignores_the_run_id(original):
+    def decide_efficiency(pair, thresholds):
+        if pair is not None:
+            pair = dataclasses.replace(pair, run_id_ref=pair.run_id_dec)
+        return original(pair, thresholds)
+
+    return decide_efficiency
+
+
+MUTATIONS: List[Mutation] = [
+    Mutation(
+        name="inclusive_cuts_written_as_strict",
+        why="The single most likely real mistake in Rule 1. Both boundary "
+            "fixtures must go red; if they do not, the boundaries are "
+            "decorative",
+        attribute="classify_f_host",
+        build=_mutant_strict_cuts,
+        fixtures_that_must_fail=["rule1.holds.exactly_on_the_cut",
+                                 "rule1.refuted.exactly_on_the_cut"]),
+    Mutation(
+        name="closure_leg_invents_a_threshold",
+        why="A closure leg that passes anything under a made-up bound is the "
+            "exact failure E6a exists to prevent, and it would look like a "
+            "clean instrument",
+        attribute="check_closure",
+        build=_mutant_closure_borrows_a_threshold,
+        fixtures_that_must_fail=["closure.terms_do_not_sum_to_the_step",
+                                 "closure.overlapping_terms_that_sum_to_the_step",
+                                 "closure.terms_exceed_the_step",
+                                 "closure.no_threshold_is_ever_borrowed"]),
+    Mutation(
+        name="rule2_drops_the_same_run_requirement",
+        why="Dropping it yields a perfectly computable ratio that means "
+            "something else, which is the kind of break that never announces "
+            "itself",
+        attribute="decide_efficiency",
+        build=_mutant_rule2_ignores_the_run_id,
+        fixtures_that_must_fail=["rule2.reference_from_another_run"]),
+]
+
+
+def prove_the_harness_can_fail(
+        thresholds: common.Thresholds) -> List[Dict[str, Any]]:
+    """Breaks the decider on purpose and requires the fixtures to notice."""
+    by_name = {f.name: f for f in ALL_FIXTURES}
+    records: List[Dict[str, Any]] = []
+    for mutation in MUTATIONS:
+        original = getattr(m1, mutation.attribute)
+        setattr(m1, mutation.attribute, mutation.build(original))
+        try:
+            observed = {name: evaluate(by_name[name], thresholds)["result"]
+                        for name in mutation.fixtures_that_must_fail}
+        finally:
+            setattr(m1, mutation.attribute, original)
+        blind = sorted(n for n, r in observed.items()
+                       if r != common.Outcome.FAILED.value)
+        records.append({
+            "mutation": mutation.name,
+            "why": mutation.why,
+            "mutated": f"m1_profile.{mutation.attribute}",
+            "fixtures_that_must_fail": list(mutation.fixtures_that_must_fail),
+            "observed": observed,
+            "fixtures_that_did_not_notice": blind,
+            "result": (common.Outcome.PASSED.value if not blind
+                       else common.Outcome.FAILED.value),
+        })
+    return records
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", default=None,
@@ -541,8 +660,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     thresholds = common.Thresholds.load(args.thresholds)
+    mutations = prove_the_harness_can_fail(thresholds)
     records = run_all(thresholds)
     counts = tally(records)
+
+    print("PROVING THE HARNESS CAN FAIL (decider deliberately broken):")
+    for mutation in mutations:
+        print(f"  {mutation['result']:35s} {mutation['mutation']}")
+        for name in mutation["fixtures_that_did_not_notice"]:
+            print(f"    NOT NOTICED BY {name}")
+    print()
 
     width = max(len(r["fixture"]) for r in records)
     for record in records:
@@ -550,6 +677,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for mismatch in record["mismatches"]:
             print(f"    {mismatch}")
     print(f"\n{counts}")
+
+    blind_mutations = [m["mutation"] for m in mutations
+                       if m["result"] != common.Outcome.PASSED.value]
+    mutation_check = common.check(
+        "e6b.the_suite_can_fail",
+        common.Outcome.PASSED if not blind_mutations else common.Outcome.FAILED,
+        "the decider was broken on purpose in each of the ways these fixtures "
+        "exist to catch, and the fixtures were required to go red",
+        {"mutations": [m["mutation"] for m in mutations],
+         "mutations_not_noticed": blind_mutations})
 
     if args.out:
         checks = [
@@ -561,13 +698,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "run; every one is recorded here next to its outcome",
                 {"tally": counts, "fixtures": len(records)}),
         ]
-        common.write_artifact(args.out,
-                              kind="e6b.decider_fixtures",
-                              payload={"records": records, "tally": counts},
-                              checks=checks,
-                              thresholds=thresholds)
+        common.write_artifact(
+            args.out,
+            kind="e6b.decider_fixtures",
+            payload={"records": records, "tally": counts,
+                     "mutations": mutations,
+                     "reading_note":
+                         "The fixture tally is only meaningful alongside the "
+                         "mutation records. A suite that cannot go red has "
+                         "not checked anything, and a green tally is what "
+                         "that looks like from outside."},
+            checks=checks + [mutation_check],
+            thresholds=thresholds)
 
-    return 0 if counts[common.Outcome.FAILED.value] == 0 else 1
+    blind = [m for m in mutations if m["result"] != common.Outcome.PASSED.value]
+    if counts[common.Outcome.FAILED.value] or blind:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
