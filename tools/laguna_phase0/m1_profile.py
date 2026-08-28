@@ -356,6 +356,27 @@ def step_profile_from_intervals(
     # folding unmapped time in here would net an omission against a double count
     # and make both unreadable.
     overlap = sum(q.value for q in per_bucket.values()) - union_duration(mapped_only)
+    # ROUND 2: THIS USED TO BE `max(0.0, overlap)` AT THE USE SITE BELOW, AND
+    # THAT CLAMP MADE A CONTROL UNREACHABLE.
+    #
+    # A sum of parts cannot be less than their union, so a negative overlap is an
+    # arithmetic contradiction and is the single strongest signal available that
+    # the interval arithmetic or the bucket mapping is broken. `max(0.0, ...)`
+    # sent that signal to the decider as a clean zero -- AT ANY MAGNITUDE, not
+    # merely at machine noise -- so `check_bucket_overlap` could never see it and
+    # its FAILED arm could never fire from emitter-routed input. THE CLAMP TURNED
+    # EVIDENCE THAT THE INSTRUMENT IS WRONG INTO APPARENT AGREEMENT, in the one
+    # direction that flatters us: an emitter that under-reports overlap makes the
+    # closure residual look like a closure measure when it is not.
+    #
+    # What survives is the part that was actually justified: noise. The overlap
+    # is a difference of sums and lands a few ulps either side of zero on exact
+    # inputs, so a value INSIDE the representable-noise floor is normalised to
+    # zero. A value OUTSIDE it is passed through unaltered and adjudicated
+    # downstream, where a reader can see it. The floor is published in the
+    # check's intermediates.
+    if abs(overlap) <= _OVERLAP_SIGN_EPSILON:
+        overlap = 0.0
 
     return DecodeStepProfile(
         step=step,
@@ -364,7 +385,7 @@ def step_profile_from_intervals(
         idle_strict=Quantity(idle_strict, COUNTER_IDLE_STRICT),
         idle_loose=Quantity(idle_loose, COUNTER_IDLE_LOOSE),
         buckets=per_bucket,
-        bucket_overlap=Quantity(max(0.0, overlap), COUNTER_BUCKET_OVERLAP),
+        bucket_overlap=Quantity(overlap, COUNTER_BUCKET_OVERLAP),
         hbm_bytes=hbm_bytes,
         unmapped_event_seconds=total_duration([c for _, c in unmapped_clipped]),
         unmapped_event_names=tuple(sorted({n for n, _ in unmapped_clipped})))
@@ -742,27 +763,71 @@ def decide_efficiency(pair: Optional[EfficiencyPair],
 # asked to set, it is the precision of the arithmetic that produces the number.
 _RESIDUAL_SIGN_EPSILON = 1e-12
 
+# Published in the intermediates of both unadjudicated publishers, on EVERY
+# return path including the passing one. Round 2, P1: the two legs used to
+# encode "nobody has set a threshold" by returning UNDETERMINED, which put a
+# verdict-axis fact on the outcome axis and pinned `worst()`. The fact still has
+# to be carried -- it is just carried where it belongs, in the payload a reader
+# actually reads, rather than in a disposition a harness gates on.
+_NOT_ADJUDICATED = "NOT_ADJUDICATED"
+
+# The same representable-noise floor as the closure residual, for the same
+# reason and on the same footing: the overlap is a sum of per-term durations
+# minus a union, so machine-precision noise either side of zero is reachable
+# and is not a finding. Anything BEYOND the floor is. Not a tuning constant --
+# no party is being asked to set one -- and it is published in the
+# intermediates so a reader can see exactly what was treated as zero.
+_OVERLAP_SIGN_EPSILON = 1e-12
+
 
 def check_closure(derivations: Sequence[StepDerivation],
                   thresholds: common.Thresholds) -> common.Check:
     """The closure residual, per step, as a fraction of S.
 
     NO THRESHOLD EXISTS FOR THIS AND NONE IS INVENTED HERE. The entry in
-    thresholds.json is null with kind 'deliberately-absent'. So the leg can
-    return exactly two things:
+    thresholds.json is null with kind 'deliberately-absent'.
+
+    SUPERSEDED PARAGRAPH, KEPT VERBATIM BECAUSE THE REASONING IS STILL WORTH
+    READING AND DELETING IT WOULD HIDE THAT THE CHANGE HAPPENED:
+
+      "So the leg can return exactly two things: FAILED when the residual is
+       negative ... UNDETERMINED in every other case. The residual is published
+       and left for a human to read. It never returns PASSED, because a pass
+       would assert a standard that no party has set."
+
+    WHY IT IS SUPERSEDED (round 2, P1 REOPENED). That paragraph reads PASSED as
+    a verdict-axis value -- "this residual is good" -- and having read it that
+    way it had no choice but to refuse it. But PASSED on this package's OUTCOME
+    axis means the measurement succeeded, and nothing else. The module argues
+    exactly that for itself at ``main():994-998``: HOLDS, MIXED and REFUTED are
+    all PASSED, because a refutation is a successful measurement. This leg was
+    the one place the module did not take its own side of that distinction, and
+    the cost was concrete: ``worst()`` promotes UNDETERMINED over PASSED, so a
+    leg that can never pass pins the aggregate, and ``main()`` returned 1 for
+    every input that could be constructed. AN EXIT CODE WITH ONE REACHABLE
+    VALUE IS NOT A SAFER SIGNAL THAN ONE WITH THE WRONG VALUE. IT IS THE SAME
+    DEFECT WITH A LOUDER FAILURE MODE, AND IT GETS SILENCED AS NOISE.
+
+    So the leg now returns:
 
       FAILED         when the residual is negative, meaning the named terms
                      sum to more wall time than the step contains. Zero is not
                      a tuning constant; it is the edge of arithmetic
                      possibility, and a negative residual is a double count.
-      UNDETERMINED   in every other case. The residual is published and left
-                     for a human to read. It never returns PASSED, because a
-                     pass would assert a standard that no party has set.
+      UNDETERMINED   when the residual could not be MEASURED or could not be
+                     READ AS CLOSURE: no steps at all, a step carrying no
+                     bucket-overlap measurement, or named terms that overlap.
+      PASSED         when every step's residual was measured and published and
+                     none of the above applies. THIS ASSERTS NO STANDARD. No
+                     party has set a threshold, none is invented, and the
+                     intermediates carry ``adjudication: NOT_ADJUDICATED`` on
+                     every path including this one so that a reader who takes
+                     PASSED for an endorsement is contradicted by the artifact.
 
     A residual near zero is NOT evidence of good attribution while the bucket
     overlap is non-zero: overlapping terms can sum to S while double-counting
     one region and omitting another. So the overlap travels with the residual
-    and the reason says so out loud.
+    and the reason says so out loud -- and that case does not reach PASSED.
     """
     name = "m1.closure_residual"
     entry = thresholds.entry("m1.closure_residual_threshold")
@@ -770,7 +835,8 @@ def check_closure(derivations: Sequence[StepDerivation],
         return common.check(
             name, common.Outcome.UNDETERMINED,
             "no steps, so there is no residual to publish",
-            {"steps": 0, "threshold": entry.to_dict()})
+            {"steps": 0, "threshold": entry.to_dict(),
+             "adjudication": _NOT_ADJUDICATED})
 
     by_step = {d.step: d.unattributed_fraction for d in derivations}
     seconds = {d.step: d.unattributed_s for d in derivations}
@@ -789,6 +855,7 @@ def check_closure(derivations: Sequence[StepDerivation],
         "spread": common.summarise(list(by_step.values())),
         "threshold": entry.to_dict(),
         "sign_epsilon": _RESIDUAL_SIGN_EPSILON,
+        "adjudication": _NOT_ADJUDICATED,
     }
 
     # Round 1 non-blocking: an exact `< 0.0` fires on -2.8e-17. The residual is a
@@ -832,33 +899,61 @@ def check_closure(derivations: Sequence[StepDerivation],
             "it next to the bucket overlap. No threshold exists for either",
             intermediates)
 
+    # THE OUTCOME AXIS ONLY. Every step's residual was measured, none is
+    # negative, every step carries an overlap measurement and none of the named
+    # terms overlap -- so the quantity this leg exists to produce was produced.
+    # That is what PASSED records here. It is NOT a statement that the residual
+    # is small, acceptable or good; no party has set a threshold for it and the
+    # adjudication field in the intermediates says so on this path too.
     return common.check(
-        name, common.Outcome.UNDETERMINED,
-        "residual published with no verdict attached: no party has set a "
-        "threshold for it, and this module does not invent one",
+        name, common.Outcome.PASSED,
+        "residual measured for every step and published with no verdict "
+        "attached: no party has set a threshold for it, and this module does "
+        "not invent one. PASSED here means the measurement succeeded, not that "
+        "the residual is acceptable",
         intermediates)
 
 
 def check_bucket_overlap(derivations: Sequence[StepDerivation],
                          thresholds: common.Thresholds) -> common.Check:
-    """How much wall time two named terms both claim. Also unadjudicated."""
+    """How much wall time two named terms both claim. Also unadjudicated.
+
+    A PUBLISHER, NOT A CONTROL, AND NAMED LIKE A CONTROL -- established over
+    4000 randomised runs in the M1 audit and confirmed statically since. Round 2
+    does not change what it is; it changes only which axis carries the fact that
+    nobody has adjudicated it. See ``check_closure``'s docstring for the full
+    reasoning, which applies here identically: UNDETERMINED means the overlap
+    could not be measured, PASSED means it was measured for every step and
+    published, and neither says anything about whether the value is acceptable.
+    ``m1.bucket_overlap_threshold`` remains ``kind=deliberately-absent`` and
+    this leg still refuses to invent one.
+
+    NOTE THE INTERACTION THAT KEEPS THIS HONEST: a non-zero overlap does not
+    reach a PASSED aggregate anyway, because ``check_closure`` refuses to read
+    the residual as closure whenever the named terms overlap and returns
+    UNDETERMINED, which ``worst()`` promotes. So "the run exited 0" still
+    requires non-overlapping terms. This leg passing is not a way around that.
+    """
     name = "m1.bucket_overlap"
     entry = thresholds.entry("m1.bucket_overlap_threshold")
     if not derivations:
         return common.check(name, common.Outcome.UNDETERMINED,
                             "no steps, so there is no overlap to publish",
-                            {"steps": 0, "threshold": entry.to_dict()})
+                            {"steps": 0, "threshold": entry.to_dict(),
+                             "adjudication": _NOT_ADJUDICATED})
 
     unknown = [d.step for d in derivations if d.bucket_overlap_s is None]
     fractions = {d.step: d.bucket_overlap_fraction
                  for d in derivations if d.bucket_overlap_fraction is not None}
+    overlap_seconds = {d.step: d.bucket_overlap_s for d in derivations}
     intermediates = {
         "definition": "sum of per-term durations minus the union across terms",
         "overlap_fraction_by_step": fractions,
-        "overlap_seconds_by_step":
-            {d.step: d.bucket_overlap_s for d in derivations},
+        "overlap_seconds_by_step": overlap_seconds,
         "steps_without_an_overlap_measurement": unknown,
         "threshold": entry.to_dict(),
+        "adjudication": _NOT_ADJUDICATED,
+        "sign_epsilon": _OVERLAP_SIGN_EPSILON,
     }
     if unknown:
         return common.check(
@@ -866,11 +961,43 @@ def check_bucket_overlap(derivations: Sequence[StepDerivation],
             "some steps carry no overlap measurement, so their closure "
             "residual cannot be read as a closure measure at all",
             intermediates)
+    # THE FAILED ARM, ADDED IN ROUND 2 SO THAT FAILED IS NOT DECORATIVE HERE.
+    #
+    # A negative overlap is not a small overlap. The overlap is defined as the
+    # sum of the per-term durations minus their union, and by inclusion-exclusion
+    # a sum of parts can never be less than their union -- so a negative value is
+    # not a measurement at all, it is an arithmetic contradiction, exactly as a
+    # negative closure residual is. Zero is not a threshold anybody set; it is
+    # the edge of arithmetic possibility.
+    #
+    # THIS ARM WAS UNREACHABLE FROM THE EMITTER UNTIL THE CLAMP AT
+    # `step_profile_from_intervals` WAS REMOVED IN THE SAME CHANGE. That clamp
+    # ran a `max(0.0, ...)` over the emitted overlap, so an emitter defect large
+    # enough to drive the overlap negative arrived here as a clean zero and this
+    # leg could only ever report health. An arm whose input is filtered upstream
+    # is a control that cannot fire. See the note at the clamp site.
+    negative = {s: v for s, v in overlap_seconds.items()
+                if v is not None and v < -_OVERLAP_SIGN_EPSILON}
+    if negative:
+        intermediates["negative_overlap_steps"] = negative
+        return common.check(
+            name, common.Outcome.FAILED,
+            "the per-term durations sum to LESS than their union, which is "
+            "arithmetically impossible. This is an instrument fault in the "
+            "emitter or in the interval arithmetic, not a threshold being "
+            "crossed and not a small overlap",
+            intermediates)
+
     intermediates["spread"] = common.summarise(list(fractions.values()))
+    # OUTCOME AXIS ONLY -- see the docstring. Every step carried an overlap
+    # measurement and every one of them was published.
     return common.check(
-        name, common.Outcome.UNDETERMINED,
-        "overlap published with no verdict attached: no threshold exists for "
-        "it and none is invented here",
+        name, common.Outcome.PASSED,
+        "overlap measured for every step and published with no verdict "
+        "attached: no threshold exists for it and none is invented here. "
+        "PASSED here means the measurement succeeded, not that the overlap is "
+        "acceptable -- a large overlap passes this leg and is caught by "
+        "m1.closure_residual, which refuses to read the residual as closure",
         intermediates)
 
 

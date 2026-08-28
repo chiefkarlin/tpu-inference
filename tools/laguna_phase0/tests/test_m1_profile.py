@@ -229,12 +229,26 @@ def test_a_double_count_still_drives_the_residual_negative_from_the_emitter():
 
 
 def test_check_closure_reads_an_emitted_profile_and_not_a_hand_built_one():
-    """R2. The closure leg's coverage must include real emitter output."""
+    """R2. The closure leg's coverage must include real emitter output.
+
+    THE OUTCOME ASSERTION CHANGED IN ROUND 2 AND THE CHANGE IS NOT COSMETIC, SO
+    IT IS WRITTEN DOWN RATHER THAN FLIPPED. This step is 30 percent unattributed
+    -- a mystery kernel nobody has a bucket for -- and this leg now reports
+    PASSED on it. That is the honest cost of P1's fix and it is asserted here on
+    purpose, as an exhibit rather than a footnote: PASSED on this leg means the
+    residual was measured and published, and NOTHING about whether 30 percent
+    unattributed is tolerable. No party has set a threshold that could say. The
+    protection against a reader taking it for an endorsement is the
+    ``adjudication`` field and the reason text, both asserted below -- if a
+    future change drops either, this test fails and the exhibit is not lost.
+    """
     profile = emitted_step(unmapped=[("mystery_kernel", (0.4, 0.7))])
     chk = m1.check_closure([m1.derive(profile)], thresholds())
-    assert chk.outcome is common.Outcome.UNDETERMINED
+    assert chk.outcome is common.Outcome.PASSED
     assert chk.intermediates["unattributed_fraction_by_step"][0] == approx(0.30)
     assert chk.intermediates["unmapped_seconds_by_step"][0] == approx(0.30)
+    assert chk.intermediates["adjudication"] == "NOT_ADJUDICATED"
+    assert "not that the residual is acceptable" in chk.reason
 
 
 def test_the_emitter_reports_unmapped_time_it_clipped_to_the_window():
@@ -390,11 +404,21 @@ def test_terms_that_exceed_the_step_are_an_arithmetic_contradiction():
 
 
 def test_a_residual_is_published_and_never_adjudicated():
+    """The name is still exactly right and the outcome assertion still moved.
+
+    ROUND 2, P1: "never adjudicated" is a VERDICT-axis property and it is
+    unchanged -- no threshold exists, none is invented, and the adjudication
+    field says NOT_ADJUDICATED. What moved is the OUTCOME-axis disposition,
+    which now records that the residual was successfully measured. The two
+    assertions are kept side by side so the distinction is legible from the
+    test rather than only from the module.
+    """
     derived = [m1.derive(step(0.20, {"a": 0.30}))]
     chk = m1.check_closure(derived, thresholds())
-    assert chk.outcome is common.Outcome.UNDETERMINED
+    assert chk.outcome is common.Outcome.PASSED
     assert abs(chk.intermediates["unattributed_fraction_by_step"][0] - 0.50) < 1e-12
     assert chk.intermediates["threshold"]["value"] is None
+    assert chk.intermediates["adjudication"] == "NOT_ADJUDICATED"
 
 
 def test_terms_that_sum_to_the_step_while_overlapping_do_not_read_as_closed():
@@ -413,6 +437,268 @@ def test_no_overlap_measurement_means_the_residual_cannot_be_read_as_closure():
     chk = m1.check_bucket_overlap([m1.derive(profile)], thresholds())
     assert chk.outcome is common.Outcome.UNDETERMINED
     assert chk.intermediates["steps_without_an_overlap_measurement"] == [0]
+
+
+# --- P1 (REOPENED): the exit code had exactly one reachable value ---------
+#
+# ROUND 1 CLOSED P1 BY CHANGING `return 0` INTO `return 0 if PASSED else 1`,
+# WHICH TURNED AN ALWAYS-0 INTO AN ALWAYS-1. Both publishers below could only
+# ever return UNDETERMINED, `worst()` promotes UNDETERMINED over PASSED, so the
+# aggregate was pinned and `main()` returned 1 for every input anybody could
+# construct -- including a perfectly clean one.
+#
+# THE REASON THE ROUND 1 SUITE DID NOT CATCH IT IS THE POINT OF THIS SECTION.
+# Every existing assertion on these two legs asserts UNDETERMINED on an input
+# chosen to be undeterminable, and every such assertion passes just as happily
+# against a leg that is incapable of returning anything else. A CHECK THAT IS
+# ONLY EVER SHOWN ITS OWN FAILING SIDE CANNOT DISTINGUISH "IT ANSWERED
+# CORRECTLY" FROM "IT HAS ONE ANSWER". So the tests here are paired: each
+# asserts the reachability of the OTHER arm, and the exit-code test asserts
+# BOTH exit values from ONE test, because a test that only ever asserts `1`
+# would have been green against the defect it exists to catch.
+
+
+def _clean_document():
+    """A profile document with nothing wrong with it, emitter-routed.
+
+    Three steps, one compute bucket each, no overlapping terms, no unmapped
+    device time, and an efficiency pair measured in the same run. If exit 0 is
+    reachable at all it is reachable here.
+    """
+    profiles = [emitted_step(index=i) for i in range(3)]
+    return {
+        "steps": [p.to_dict() for p in profiles],
+        "efficiency_pair": {"e_dec": 0.75, "e_ref": 0.80,
+                            "run_id_dec": "run-a", "run_id_ref": "run-a"},
+    }
+
+
+def test_a_clean_run_and_a_broken_run_do_not_get_the_same_exit_code():
+    """THE TEST THAT WOULD HAVE CAUGHT P1, AND THE REASON IT IS ONE TEST.
+
+    Split into two tests, the failing half stays green against a constant 1 and
+    somebody deletes the other half as flaky. Asserting the SPREAD -- that the
+    two inputs disagree -- is the assertion that cannot be satisfied by a
+    constant, whatever constant it is.
+    """
+    import json
+    import os
+    import tempfile
+
+    def run(document):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "profile.json")
+            out = os.path.join(tmp, "m1.json")
+            with open(src, "w", encoding="utf-8") as handle:
+                json.dump(document, handle)
+            return m1.main(["--profile", src, "--out", out])
+
+    clean = run(_clean_document())
+
+    # THE NEGATIVE CONTROL ON THE REMEDY, PER THE STANDING RULE THAT A REMEDY IS
+    # NOT VALIDATED BY THE SYMPTOM DISAPPEARING. Two named terms that both claim
+    # the same wall time drive the closure residual negative, which is an
+    # arithmetic contradiction and must still be reported as one.
+    broken = _clean_document()
+    broken["steps"] = [
+        emitted_step(index=i,
+                     mapped={"a": [m1.Interval(0.0, 0.6)],
+                             "b": [m1.Interval(0.3, 0.9)]}).to_dict()
+        for i in range(3)
+    ]
+    faulty = run(broken)
+
+    assert clean == 0, (
+        "a clean, internally consistent profile must exit 0; got "
+        f"{clean}. If this is 1 the exit code is pinned again")
+    assert faulty == 1, (
+        "a double-counted profile must still exit 1; got "
+        f"{faulty}. If this is 0 the fix silenced the detector")
+    assert clean != faulty, "the exit code carries no information"
+
+
+def test_both_publishers_can_reach_passed_or_the_aggregate_is_pinned():
+    """P1's root cause, asserted at the leg rather than at the exit code.
+
+    `check_bucket_overlap` was the leg named in the review. It was not the only
+    one: `check_closure` is a second publisher with the same shape, and a fix
+    that repaired only the named leg would have left `worst()` UNDETERMINED and
+    the exit code a constant 1. Both are asserted here so neither can regress
+    behind the other.
+    """
+    profiles = [emitted_step(index=i) for i in range(3)]
+    derived = [m1.derive(p) for p in profiles]
+    ts = thresholds()
+
+    assert m1.check_closure(derived, ts).outcome is common.Outcome.PASSED
+    assert m1.check_bucket_overlap(derived, ts).outcome is common.Outcome.PASSED
+
+    pair = m1.EfficiencyPair(e_dec=0.75, e_ref=0.80,
+                             run_id_dec="run-a", run_id_ref="run-a")
+    _, checks = m1.assess(profiles, pair, ts)
+    pinned = [c.name for c in checks
+              if c.outcome is not common.Outcome.PASSED]
+    assert not pinned, f"legs that cannot pass on a clean run: {pinned}"
+
+
+def test_every_state_of_check_bucket_overlap_is_reachable():
+    """EM2's condition on P1: a state nothing can reach is decorative.
+
+    Before round 2 this leg had exactly one reachable state. Adding PASSED
+    without adding a reachable FAILED would have swapped a constant 1 for a
+    constant 0, which is worse, because a constant 0 looks like health.
+    """
+    ts = thresholds()
+    reached = {}
+
+    reached[m1.check_bucket_overlap([], ts).outcome] = "no steps"
+
+    no_measurement = [m1.derive(m1.DecodeStepProfile(
+        step=0, run_id="r", step_time=quantity(1.0), idle_strict=quantity(0.2),
+        idle_loose=quantity(0.2), buckets={"a": quantity(0.8)},
+        bucket_overlap=None))]
+    reached[m1.check_bucket_overlap(no_measurement, ts).outcome] = "unmeasured"
+
+    clean = [m1.derive(emitted_step())]
+    reached[m1.check_bucket_overlap(clean, ts).outcome] = "measured"
+
+    # A sum of parts below their union is arithmetically impossible. Reachable
+    # at the DECIDER entry point from any profile document -- `step_from_dict`
+    # reads `bucket_overlap` straight out of the JSON, so a broken emitter puts
+    # this in front of the decider without anyone hand-building anything.
+    contradictory = [m1.derive(step(0.20, {"a": 0.30}, overlap=-0.05))]
+    chk = m1.check_bucket_overlap(contradictory, ts)
+    reached[chk.outcome] = "negative overlap"
+    assert chk.intermediates["negative_overlap_steps"] == {0: -0.05}
+    assert "impossible" in chk.reason
+
+    missing = {o.value for o in common.Outcome} - {o.value for o in reached}
+    assert not missing, f"unreachable states on m1.bucket_overlap: {missing}"
+
+
+def test_the_emitter_no_longer_filters_the_arm_that_watches_it():
+    """THE CLAMP WAS THE REASON THE FAILED ARM ABOVE COULD NOT FIRE IN PRACTICE.
+
+    `step_profile_from_intervals` ran `max(0.0, overlap)` over its own output, so
+    an emitter defect large enough to drive the overlap negative reached the
+    decider as a clean zero. AN ARM WHOSE INPUT IS FILTERED UPSTREAM IS NOT AN
+    ARM. This test injects a fault into the interval arithmetic the emitter
+    depends on and requires the fault to survive the trip to the check.
+
+    The noise floor is asserted in the same test, because removing a clamp
+    without keeping the noise floor would trade a silent false-zero for a noisy
+    false-FAILED, and that is the opposite error rather than no error.
+    """
+    real_union = m1.union_duration
+
+    def overstating_union(intervals):
+        """An emitter defect that hits the ACROSS-TERMS union only.
+
+        A fault that scaled every union alike would cancel out of the
+        subtraction and prove nothing -- the per-term durations come from the
+        same function. Keying on the multi-interval call reaches the union
+        across terms while leaving the single-interval per-bucket calls alone,
+        which is what makes the two sides disagree.
+        """
+        duration = real_union(intervals)
+        return duration * 2 if len(intervals) > 1 else duration
+
+    m1.union_duration = overstating_union
+    try:
+        profile = m1.step_profile_from_intervals(
+            step=0, run_id="r", window=m1.Interval(0.0, 1.0),
+            intervals_by_bucket={"a": [m1.Interval(0.0, 0.4)],
+                                 "b": [m1.Interval(0.5, 0.7)]},
+            mapping=m1.EventMapping({}, {"a": m1.BucketKind.COMPUTE,
+                                         "b": m1.BucketKind.COMPUTE}))
+    finally:
+        m1.union_duration = real_union
+
+    assert profile.bucket_overlap.value == approx(-0.6, tol=1e-9)
+    chk = m1.check_bucket_overlap([m1.derive(profile)], thresholds())
+    assert chk.outcome is common.Outcome.FAILED, (
+        "a negative overlap emitted by a broken emitter must reach the check; "
+        "if this passes as clean the clamp is back")
+
+    # And the noise floor still absorbs machine noise rather than reporting it.
+    quiet = m1.step_profile_from_intervals(
+        step=0, run_id="r", window=m1.Interval(0.0, 1.0),
+        intervals_by_bucket={"a": [m1.Interval(0.0, 0.4)],
+                             "b": [m1.Interval(0.4, 0.7)]},
+        mapping=m1.EventMapping({}, {"a": m1.BucketKind.COMPUTE,
+                                     "b": m1.BucketKind.COMPUTE}))
+    assert quiet.bucket_overlap.value == approx(0.0)
+    assert (m1.check_bucket_overlap([m1.derive(quiet)], thresholds()).outcome
+            is common.Outcome.PASSED)
+
+
+def test_every_state_of_check_closure_is_reachable():
+    """The same condition, applied to the other publisher."""
+    ts = thresholds()
+    reached = {}
+    reached[m1.check_closure([], ts).outcome] = "no steps"
+    reached[m1.check_closure([m1.derive(emitted_step())], ts).outcome] = "clean"
+    overlapping = [m1.derive(step(0.20, {"a": 0.50, "b": 0.30}, overlap=0.25))]
+    reached[m1.check_closure(overlapping, ts).outcome] = "terms overlap"
+    doubled = [m1.derive(step(0.20, {"a": 0.50, "b": 0.60}))]
+    reached[m1.check_closure(doubled, ts).outcome] = "double count"
+
+    missing = {o.value for o in common.Outcome} - {o.value for o in reached}
+    assert not missing, f"unreachable states on m1.closure_residual: {missing}"
+
+
+def test_a_passing_publisher_still_attaches_no_verdict():
+    """PASSED IS AN OUTCOME-AXIS VALUE AND MUST NOT LEAK ONTO THE VERDICT AXIS.
+
+    The whole risk of this fix is that a reader takes `m1.closure_residual:
+    PASSED` as "the closure is good". It means the residual was measured for
+    every step and published. No party has set a threshold for it and this
+    module still does not invent one, so the adjudication field must say so
+    even on the passing path -- otherwise the fix has smuggled in a standard.
+    """
+    derived = [m1.derive(p) for p in (emitted_step(index=i) for i in range(2))]
+    ts = thresholds()
+    for chk in (m1.check_closure(derived, ts),
+                m1.check_bucket_overlap(derived, ts)):
+        assert chk.outcome is common.Outcome.PASSED
+        assert chk.intermediates["adjudication"] == "NOT_ADJUDICATED"
+        assert chk.intermediates["threshold"]["value"] is None
+        assert "no verdict" in chk.reason
+
+
+def test_the_undeterminable_arms_of_both_publishers_survive_the_fix():
+    """NEGATIVE CONTROL ON THE FIX ITSELF, ARM BY ARM.
+
+    Making a leg able to pass is the easy half. The half that goes wrong is the
+    one where every arm becomes a pass -- which is the vacuous-pass defect this
+    package has already been bitten by elsewhere. Each arm that must NOT pass is
+    named and exercised.
+    """
+    ts = thresholds()
+
+    # No steps at all. Fed nothing, a check must not say PASS.
+    assert m1.check_closure([], ts).outcome is common.Outcome.UNDETERMINED
+    assert m1.check_bucket_overlap([], ts).outcome is common.Outcome.UNDETERMINED
+
+    # A step carrying no overlap measurement: the quantity was never measured,
+    # which is not the same world as measured-and-zero.
+    unmeasured = [m1.derive(m1.DecodeStepProfile(
+        step=0, run_id="r", step_time=quantity(1.0), idle_strict=quantity(0.2),
+        idle_loose=quantity(0.2), buckets={"a": quantity(0.8)},
+        bucket_overlap=None))]
+    assert m1.check_closure(unmeasured, ts).outcome is common.Outcome.UNDETERMINED
+    assert (m1.check_bucket_overlap(unmeasured, ts).outcome
+            is common.Outcome.UNDETERMINED)
+
+    # Named terms that overlap each other: the residual is still published but
+    # it cannot be read as a closure measure, so the outcome axis stays open.
+    overlapping = [m1.derive(step(0.20, {"a": 0.50, "b": 0.30}, overlap=0.25))]
+    assert (m1.check_closure(overlapping, ts).outcome
+            is common.Outcome.UNDETERMINED)
+
+    # A double count is still an arithmetic contradiction, not a pass.
+    doubled = [m1.derive(step(0.20, {"a": 0.50, "b": 0.60}))]
+    assert m1.check_closure(doubled, ts).outcome is common.Outcome.FAILED
 
 
 # --- counter provenance --------------------------------------------------
