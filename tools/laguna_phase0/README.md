@@ -292,3 +292,93 @@ null and the escalation recorded in its source field.
 
 A capture that does not record whether padding rows were routed and counted
 cannot answer the padding question at all, and says so rather than answering it.
+
+## M1 -- `m1_profile.py`
+
+The device profile emitter and the two-rule decider. It ingests an
+already-captured trace and decides; it starts no profiler and runs no model,
+which is what makes the decider a pure function of emitted quantities and
+therefore checkable against synthetic fixtures with no TPU in the room.
+
+### Two axes, deliberately not collapsed
+
+Each leg reports a `common.Outcome` **and**, where a rule was evaluated, a rule
+verdict inside its intermediates.
+
+| axis | question | values |
+|---|---|---|
+| outcome | could this be decided mechanically from what was emitted? | PASSED / FAILED / COULD_NOT_BE_CHECKED_MECHANICALLY |
+| verdict | *which* defined disposition | HOLDS / MIXED / REFUTED, BYTE_BOUND / PARTIAL / EFFICIENCY_DEFICIT / VOID |
+
+A PASSED check can carry a REFUTED verdict: the rule ran and the answer was no.
+Folding the axes would make "the rule refuted the hypothesis" and "the rule
+could not be run" the same string, and those two must be told apart.
+
+### Rule 1
+
+`f_host = I / S` on the **strict** idle definition, cuts inclusive: `>= 0.45`
+HOLDS, `<= 0.12` REFUTED, strictly between MIXED. **MIXED is a defined branch
+of the rule, not a failure of it** -- 0.30 is answered, not deferred.
+
+Steps of one run landing in *different* branches is a different fact and is not
+allowed to borrow the name MIXED: that returns
+COULD_NOT_BE_CHECKED_MECHANICALLY with `branches_present` published.
+`f_host` outside `[0, 1]` is an instrument fault and returns FAILED.
+
+### The non-overlap term
+
+`I_loose - I_strict`: DMA in flight with no compute running. **Its own channel.
+Never added into `I`, never substituted into Rule 1.** The design asserts it
+sits nowhere near the cuts; "near" has no tolerance from any named party and
+none is invented here. What is mechanical, and stronger, is the substitution
+test: recompute the branch with the loose definition and see whether it moves.
+If it moves, the leg FAILS -- the verdict would be a property of a definitional
+choice rather than of the machine.
+
+### Rule 2
+
+`e_dec` against `e_ref`, both from the **same profile run** -- the run ids
+travel with the values and a mismatch is UNDETERMINED, not a ratio. `e_ref`
+below 0.5 makes the cut VOID before the ratio is read at all. Otherwise
+`>= 0.85 x e_ref` BYTE_BOUND, `<= 0.60 x e_ref` EFFICIENCY DEFICIT, between
+them PARTIAL.
+
+### E6a: closure residual and bucket overlap
+
+```
+unattributed = S - (I_strict + every named term + unmapped trace events)
+```
+
+emitted per step as a fraction of `S`, first-class, never folded into another
+term. Unmapped events are kept rather than dropped: they are exactly the
+material of the residual, and discarding them would make it look smaller.
+
+**There is no threshold for the residual and none is invented here.** Both
+`m1.closure_residual_threshold` and `m1.bucket_overlap_threshold` are null with
+kind `deliberately-absent`. The leg therefore returns only:
+
+* FAILED when the residual is negative -- the named terms sum to more wall time
+  than the step contains, which is a double count. Zero is not a tuning
+  constant; it is the edge of arithmetic possibility.
+* COULD_NOT_BE_CHECKED_MECHANICALLY otherwise, publishing the residual. It
+  never returns PASSED, because a pass would assert a standard nobody set.
+
+The **bucket overlap** -- per-term durations summed, minus their union -- is
+emitted next to the residual because it is what makes a residual of zero
+uninformative: overlapping terms can sum exactly to `S` while double-counting
+one region and omitting another. When the overlap is non-zero the reason string
+says the residual is not a closure measure. When the overlap was never
+measured, the leg says the residual cannot be read as one at all.
+
+### Counter provenance
+
+Every emitted counter carries its units and their source next to the value.
+Quantities this module computes from interval arithmetic are confirmed by
+construction. `hbm_bytes` is declared **unconfirmed** and emits its unit as
+`UNKNOWN (claimed: bytes)` until a caller confirms it against the profiler's
+own documentation: a bytes/KiB/elements confusion does not produce an
+implausible number, it produces a different verdict. `m1.counter_units_confirmed`
+lists every counter still unconfirmed.
+
+`m1.reference_step_ms` exists in `thresholds.json` for orientation only. No leg
+reads it, and a test asserts that assessing a run never touches it.
