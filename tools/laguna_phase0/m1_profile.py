@@ -329,21 +329,33 @@ def step_profile_from_intervals(
         for bucket, intervals in clipped.items()
     }
 
-    everything: List[Interval] = []
+    unmapped_clipped = [(name, c)
+                        for name, c in ((n, i.clipped(window.start, window.end))
+                                        for n, i in unmapped) if c is not None]
+
+    mapped_only: List[Interval] = []
     compute_only: List[Interval] = []
     for bucket, intervals in clipped.items():
-        everything.extend(intervals)
+        mapped_only.extend(intervals)
         if mapping.kind(bucket) is BucketKind.COMPUTE:
             compute_only.extend(intervals)
+
+    # STRICT IDLE IS THE COMPLEMENT OF *ALL* DEVICE-BUSY TIME, MAPPED OR NOT.
+    # An unmapped kernel is a kernel executing, and the spec defines strict idle
+    # as a gap with no kernel executing and no DMA in flight. Omitting the
+    # unmapped intervals here books device-busy time as host idle, which inflates
+    # f_host and can only ever inflate it -- the error is one-signed toward the
+    # host-bound reading. See round 1 C1.
+    everything: List[Interval] = mapped_only + [c for _, c in unmapped_clipped]
 
     step_seconds = window.duration
     idle_strict = max(0.0, step_seconds - union_duration(everything))
     idle_loose = max(0.0, step_seconds - union_duration(compute_only))
-    overlap = sum(q.value for q in per_bucket.values()) - union_duration(everything)
-
-    unmapped_clipped = [(name, c)
-                        for name, c in ((n, i.clipped(window.start, window.end))
-                                        for n, i in unmapped) if c is not None]
+    # The overlap is a statement about the NAMED terms only: how much wall time
+    # two named terms both claim. It stays on the mapped union deliberately --
+    # folding unmapped time in here would net an omission against a double count
+    # and make both unreadable.
+    overlap = sum(q.value for q in per_bucket.values()) - union_duration(mapped_only)
 
     return DecodeStepProfile(
         step=step,
@@ -378,6 +390,11 @@ class StepDerivation:
     unattributed_fraction: float
     bucket_overlap_s: Optional[float]
     bucket_overlap_fraction: Optional[float]
+    # Carried so the residual is DECOMPOSABLE by a reader. Post-R1 the residual
+    # is (unmapped-exclusive busy time) - (bucket overlap), and those two can
+    # cancel. A reader who sees only the net cannot tell "nothing wrong" from
+    # "an omission netted against a double count", so both parts travel with it.
+    unmapped_event_seconds: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         out = dataclasses.asdict(self)
@@ -393,7 +410,30 @@ def derive(profile: DecodeStepProfile) -> StepDerivation:
     idle_strict = profile.idle_strict.value
     idle_loose = profile.idle_loose.value
     buckets = {k: v.value for k, v in profile.buckets.items()}
-    attributed = idle_strict + sum(buckets.values()) + profile.unmapped_event_seconds
+    # THE ATTRIBUTED SIDE IS IDLE PLUS THE *NAMED* TERMS, AND NOTHING ELSE.
+    #
+    # Round 1 R1: unmapped_event_seconds used to be added here. That is backwards
+    # by definition -- an unmapped event is precisely one the instrument could
+    # NOT attribute to a named term, so adding it to the attributed side books
+    # unattributed time as attributed and reports perfect closure over exactly
+    # the material the residual exists to surface. The closure identity the
+    # design states is
+    #
+    #     unattributed = S - (I + grouped_matmul + collective + dma_busy + ...)
+    #
+    # over the NAMED terms; unmapped is not among them.
+    #
+    # NOTE FOR ANYONE RE-DERIVING R1: fixing C1 alone does NOT make this term
+    # able to fire, contrary to the round 1 review's suggested fix. With C1 fixed
+    # and this line unchanged the residual is
+    #     union(all) - union(mapped) - overlap - total(unmapped)  <= 0
+    # because union(all) - union(mapped) <= total(unmapped) always. Measured:
+    # still 0 positives in 2000 randomised emitter profiles, max exactly 0.0.
+    # BOTH lines had to change. With both fixed the residual is
+    #     (time covered ONLY by unmapped events) - bucket_overlap
+    # which is positive on unattributed device time, negative on a double count,
+    # and therefore a check that can actually fire in both directions.
+    attributed = idle_strict + sum(buckets.values())
     unattributed = s - attributed
     overlap = profile.bucket_overlap.value if profile.bucket_overlap else None
     return StepDerivation(
@@ -409,7 +449,8 @@ def derive(profile: DecodeStepProfile) -> StepDerivation:
         unattributed_s=unattributed,
         unattributed_fraction=unattributed / s,
         bucket_overlap_s=overlap,
-        bucket_overlap_fraction=None if overlap is None else overlap / s)
+        bucket_overlap_fraction=None if overlap is None else overlap / s,
+        unmapped_event_seconds=profile.unmapped_event_seconds)
 
 
 # --------------------------------------------------------------------------
@@ -677,6 +718,12 @@ def decide_efficiency(pair: Optional[EfficiencyPair],
 # --------------------------------------------------------------------------
 
 
+# The representable-noise floor for the sign of the closure residual. See the
+# comment at its use site in check_closure: this is not a threshold anybody was
+# asked to set, it is the precision of the arithmetic that produces the number.
+_RESIDUAL_SIGN_EPSILON = 1e-12
+
+
 def check_closure(derivations: Sequence[StepDerivation],
                   thresholds: common.Thresholds) -> common.Check:
     """The closure residual, per step, as a fraction of S.
@@ -710,17 +757,28 @@ def check_closure(derivations: Sequence[StepDerivation],
     seconds = {d.step: d.unattributed_s for d in derivations}
     overlaps = {d.step: d.bucket_overlap_fraction for d in derivations}
     intermediates = {
-        "definition": "S - (I_strict + every named term + unmapped events)",
+        "definition": "S - (I_strict + every named term). Unmapped events are "
+                      "NOT a named term and are NOT on the attributed side: "
+                      "they are the material this residual exists to surface",
         "unattributed_fraction_by_step": by_step,
         "unattributed_seconds_by_step": seconds,
+        "unmapped_seconds_by_step":
+            {d.step: d.unmapped_event_seconds for d in derivations},
         "bucket_overlap_fraction_by_step": overlaps,
         "attributed_seconds_by_step": {d.step: d.attributed_s for d in derivations},
         "bucket_seconds_by_step": {d.step: dict(d.bucket_seconds) for d in derivations},
         "spread": common.summarise(list(by_step.values())),
         "threshold": entry.to_dict(),
+        "sign_epsilon": _RESIDUAL_SIGN_EPSILON,
     }
 
-    negative = {k: v for k, v in by_step.items() if v < 0.0}
+    # Round 1 non-blocking: an exact `< 0.0` fires on -2.8e-17. The residual is a
+    # difference of sums, so noise at machine precision is reachable and calling
+    # it an arithmetic contradiction would be a false FAILED. This epsilon is NOT
+    # a tuning constant and no party is being asked to set one: it is the
+    # representable-noise floor of the arithmetic itself, and it is published in
+    # the intermediates so a reader can see exactly what was treated as zero.
+    negative = {k: v for k, v in by_step.items() if v < -_RESIDUAL_SIGN_EPSILON}
     if negative:
         intermediates["negative_steps"] = negative
         return common.check(
@@ -730,7 +788,22 @@ def check_closure(derivations: Sequence[StepDerivation],
             "arithmetic contradiction, not a threshold being crossed",
             intermediates)
 
-    overlapping = {k: v for k, v in overlaps.items() if v}
+    # Round 1 non-blocking nit: `if v` conflated None (never measured) with 0.0
+    # (measured, and zero) -- the exact conflation this module works hard to
+    # avoid everywhere else. A step with NO overlap measurement is the stronger
+    # reason to refuse to read the residual as closure, not a reason to skip it.
+    unmeasured = [k for k, v in overlaps.items() if v is None]
+    overlapping = {k: v for k, v in overlaps.items() if v is not None and v != 0.0}
+    if unmeasured:
+        intermediates["steps_without_an_overlap_measurement"] = unmeasured
+        return common.check(
+            name, common.Outcome.UNDETERMINED,
+            "residual published, but at least one step carries no bucket-overlap "
+            "measurement at all. Without it the residual cannot be read as a "
+            "closure measure: an omission and a double count net against each "
+            "other and a small value would mean nothing",
+            intermediates)
+
     if overlapping:
         return common.check(
             name, common.Outcome.UNDETERMINED,
@@ -877,8 +950,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                           payload=payload(profiles, derivations, pair),
                           checks=checks,
                           thresholds=thresholds)
-    print(common.worst(c.outcome for c in checks).value)
-    return 0
+    overall = common.worst(c.outcome for c in checks)
+    print(f"M1: {overall.value}; artifact written to {args.out}")
+    for item in checks:
+        print(f"  {item.name}: {item.outcome.value} -- {item.reason}")
+    # THE EXIT CODE TRACKS THE *OUTCOME* AXIS, NEVER THE VERDICT AXIS.
+    #
+    # This used to `return 0` unconditionally -- the only main() in the package
+    # that did. An artifact recording overall_outcome FAILED still exited 0, so
+    # any harness or operator wrapper gating on exit status read every M1 result
+    # as success, and M1 is the instrument that decides between the two rival
+    # explanations. Same convention as M0/M2/M3/M4/M6: 0 decided cleanly,
+    # 1 something FAILED or could not be checked, 2 the run could not start.
+    #
+    # Deliberately NOT conditioned on the Rule 1 verdict: HOLDS, MIXED and
+    # REFUTED are all successful measurements and all exit 0. An exit code that
+    # went non-zero on REFUTED would make "the rule refuted the hypothesis"
+    # indistinguishable from "the rule could not be run", which is precisely the
+    # collapse this module's two-axis design exists to prevent.
+    return 0 if overall is common.Outcome.PASSED else 1
 
 
 if __name__ == "__main__":

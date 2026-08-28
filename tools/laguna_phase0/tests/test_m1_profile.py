@@ -13,10 +13,23 @@
 # limitations under the License.
 """Unit tests for the M1 emitter and decider.
 
-NOT EXECUTED. Written without run authorisation. The E6b fixture suite in
-``m1_decider_fixtures.py`` is the part that was run, and it was run because the
-decider is a pure function of emitted quantities and needs no TPU.
+RUN, as of round 1's fix pass, through ``tools/laguna_phase0/run_tests.py`` --
+the in-repository fallback collector, which is NOT pytest and supports only
+``raises`` and ``approx``. Before that collector was shipped this file had never
+been collected at all (round 1 R10), and the count it now produces is an
+observation from that collector rather than from pytest.
+
+**The hand-built ``step()`` helper below tests the DECIDER and nothing else.**
+Round 1 R2 found that every test of the closure and idle legs constructed
+``DecodeStepProfile`` directly, supplying ``idle_strict`` as a free argument. In
+a real profile ``idle_strict`` is DERIVED from the intervals and is constrained
+by them, so a hand-built profile can express states the emitter cannot produce
+-- and, worse, cannot express the emitter's own mistakes. That is why a green
+suite missed C1 and R1. Tests of the EMITTER live in the section marked
+"emitter-routed" and must call ``step_profile_from_intervals``.
 """
+
+import random
 
 from tools.laguna_phase0 import common
 from tools.laguna_phase0 import m1_profile as m1
@@ -24,6 +37,25 @@ from tools.laguna_phase0 import m1_profile as m1
 
 def thresholds():
     return common.Thresholds.load()
+
+
+class approx:
+    """Tolerant float comparison, local so this file needs no test framework.
+
+    Interval arithmetic here is a difference of sums, so exact equality is the
+    wrong assertion even when the maths is exact: ``1.0 - 0.7`` is
+    ``0.30000000000000004``. One assertion in this file used ``==`` and was
+    never collected, so nobody found out.
+    """
+
+    def __init__(self, expected, tol=1e-12):
+        self.expected, self.tol = expected, tol
+
+    def __eq__(self, other):
+        return abs(float(other) - float(self.expected)) <= self.tol
+
+    def __repr__(self):
+        return f"approx({self.expected!r}, tol={self.tol})"
 
 
 def quantity(value, name="q", units="seconds", confirmed=True):
@@ -72,9 +104,133 @@ def test_the_non_overlap_term_is_dma_in_flight_with_no_compute():
                              "dma": [m1.Interval(0.4, 0.7)]},
         mapping=mapping)
     derived = m1.derive(profile)
-    assert derived.idle_strict_s == 0.3
-    assert derived.idle_loose_s == 0.6
-    assert abs(derived.non_overlap_term_s - 0.3) < 1e-12
+    # Exact `== 0.3` here: 1.0 - 0.7 is 0.30000000000000004. This assertion had
+    # never been collected, so the failure had never been seen. It is a FALSE
+    # RED -- the emitter was right and the test was wrong -- which is why the
+    # adjacent non-overlap assertion below already used a tolerance.
+    assert derived.idle_strict_s == approx(0.3)
+    assert derived.idle_loose_s == approx(0.6)
+    assert derived.non_overlap_term_s == approx(0.3)
+
+
+# --- emitter-routed (R2): these MUST go through step_profile_from_intervals --
+#
+# Every test in this section drives the real emitter. None of them may build a
+# DecodeStepProfile by hand, because the defects they exist to catch are
+# defects IN the emitter and a hand-built profile cannot exhibit them.
+
+
+def emitted_step(*, mapped=None, unmapped=(), window=(0.0, 1.0), kinds=None,
+                 index=0, run_id="run-a"):
+    """One emitter-produced profile. The only profile factory this section uses."""
+    mapped = {"grouped_matmul": [m1.Interval(0.0, 0.4)]} if mapped is None else mapped
+    kinds = ({k: m1.BucketKind.COMPUTE for k in mapped} if kinds is None else kinds)
+    return m1.step_profile_from_intervals(
+        step=index, run_id=run_id, window=m1.Interval(*window),
+        intervals_by_bucket=mapped,
+        mapping=m1.EventMapping({}, kinds),
+        unmapped=[(n, m1.Interval(*iv)) for n, iv in unmapped])
+
+
+def test_unmapped_device_busy_time_is_not_booked_as_host_idle():
+    """C1. 1.0 s step: 0.40 mapped compute, 0.30 unmapped BUSY, 0.30 truly idle.
+
+    An unmapped kernel is a kernel executing. Strict idle is defined as a gap
+    with no kernel executing and no DMA in flight, so the 0.30 s of unmapped
+    device-busy time is not idle and must not be counted as such.
+    """
+    profile = emitted_step(unmapped=[("mystery_kernel", (0.4, 0.7))])
+    assert profile.unmapped_event_seconds == approx(0.30)
+    assert profile.unmapped_event_names == ("mystery_kernel",)
+
+    derived = m1.derive(profile)
+    assert derived.idle_strict_s == approx(0.30), (
+        "unmapped device-busy time was booked as strict idle")
+    assert derived.f_host_strict == approx(0.30)
+
+
+def test_unmapped_busy_time_does_not_convert_mixed_into_holds():
+    """C1, at the level that survives retelling: the published Rule 1 verdict.
+
+    True f_host here is 0.30, which is MIXED. Booking the unmapped 0.30 s as
+    idle emits 0.60, which clears the 0.45 cut and publishes HOLDS -- the
+    string that travels into a summary detached from every caveat.
+    """
+    profile = emitted_step(unmapped=[("mystery_kernel", (0.4, 0.7))])
+    chk = m1.decide_host_bound([m1.derive(profile)], thresholds())
+    assert chk.intermediates["verdict"] == "MIXED", (
+        "the emitter manufactured HOLDS out of unmapped device-busy time")
+    assert chk.intermediates["aggregate_f_host"] == approx(0.30)
+
+
+def test_the_closure_residual_can_be_positive_on_an_emitted_profile():
+    """R1. Unmapped time is time the instrument did NOT attribute to a term.
+
+    The residual is ``S - (I + every NAMED term)``. An unmapped event is by
+    definition not a named term, so the 0.30 s belongs in the residual. If it
+    is added to the attributed side instead, the residual reports perfect
+    closure over time nobody accounted for.
+    """
+    profile = emitted_step(unmapped=[("mystery_kernel", (0.4, 0.7))])
+    derived = m1.derive(profile)
+    assert derived.unattributed_s > 0.0, (
+        "the closure residual cannot go positive, so it has never been a check")
+    assert derived.unattributed_s == approx(0.30)
+    assert derived.unattributed_fraction == approx(0.30)
+
+
+def test_the_closure_residual_is_not_non_positive_by_construction():
+    """R1's control. The defect was that 2000 random profiles gave max 0.0.
+
+    This is the test that must be watched failing: it is not an assertion about
+    one profile, it is an assertion that the TERM CAN FIRE AT ALL. A quieter
+    version of a check that cannot fire would still pass every single-profile
+    test above.
+    """
+    rng = random.Random(20260828)
+    positives = 0
+    for _ in range(2000):
+        cuts = sorted(rng.uniform(0.0, 1.0) for _ in range(4))
+        mapped = {"grouped_matmul": [m1.Interval(cuts[0], cuts[1])]}
+        unmapped = [("mystery", (cuts[2], cuts[3]))]
+        derived = m1.derive(emitted_step(mapped=mapped, unmapped=unmapped))
+        if derived.unattributed_s > 1e-12:
+            positives += 1
+    assert positives > 0, (
+        "no emitter-produced profile in 2000 yielded a positive residual; the "
+        "closure term is non-positive by construction and is not a check")
+
+
+def test_a_double_count_still_drives_the_residual_negative_from_the_emitter():
+    """R1 must not be fixed by making the residual unable to go NEGATIVE either.
+
+    Two named terms covering the same wall time is a double count, and the
+    emitter's own overlap term should push the residual below zero.
+    """
+    profile = emitted_step(
+        mapped={"a": [m1.Interval(0.0, 0.6)], "b": [m1.Interval(0.3, 0.9)]})
+    derived = m1.derive(profile)
+    assert derived.bucket_overlap_s == approx(0.30)
+    assert derived.unattributed_s < 0.0
+    chk = m1.check_closure([derived], thresholds())
+    assert chk.outcome is common.Outcome.FAILED
+
+
+def test_check_closure_reads_an_emitted_profile_and_not_a_hand_built_one():
+    """R2. The closure leg's coverage must include real emitter output."""
+    profile = emitted_step(unmapped=[("mystery_kernel", (0.4, 0.7))])
+    chk = m1.check_closure([m1.derive(profile)], thresholds())
+    assert chk.outcome is common.Outcome.UNDETERMINED
+    assert chk.intermediates["unattributed_fraction_by_step"][0] == approx(0.30)
+    assert chk.intermediates["unmapped_seconds_by_step"][0] == approx(0.30)
+
+
+def test_the_emitter_reports_unmapped_time_it_clipped_to_the_window():
+    """Unmapped events straddling the window contribute only the part inside."""
+    profile = emitted_step(unmapped=[("straddler", (0.8, 1.5)),
+                                     ("outside", (2.0, 3.0))])
+    assert profile.unmapped_event_seconds == approx(0.20)
+    assert profile.unmapped_event_names == ("straddler",)
 
 
 # --- Rule 1 --------------------------------------------------------------
