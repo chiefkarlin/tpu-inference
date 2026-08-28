@@ -15,8 +15,8 @@
 
 WHY THIS FILE EXISTS
 
-Round 1 review R10: five of the seven test files in this package had never been
-collected, and the two counts that had been reported (37/37 and 24/24) were
+Round 1 review R10: five of the then-seven test files in this package had never
+been collected, and the two counts that had been reported (37/37 and 24/24) were
 produced by a hand-rolled collector kept in ``/tmp``. A count produced by an
 instrument that is not in the repository cannot be reproduced by the next
 reader, so it is not evidence -- it is an anecdote with a number in it. Two
@@ -36,7 +36,10 @@ exactly the two pytest surfaces this suite actually uses -- ``pytest.raises``
 and ``pytest.approx`` -- and nothing else. It has no fixtures, no
 ``parametrize``, no marks, no ``conftest.py``, no plugins, no assertion
 rewriting. If real pytest is importable this runner **defers to it and refuses
-to run**, so that the richer tool is never silently shadowed by the poorer one.
+to run BY DEFAULT**, so that the richer tool is never silently shadowed by the
+poorer one. **That refusal can be overridden** -- see USAGE below, where the
+override flag is named. It is stated in both places because the unqualified
+version of this sentence is what made the override an undisclosed one.
 
 Every line it prints names itself, and the summary line says
 ``laguna-phase0 fallback runner`` rather than ``passed``, because the whole
@@ -80,12 +83,17 @@ use ``--list``. An honest untested beats an unreproducible 37-of-37.
 
 That reconciliation was run on this tree rather than assumed, and it is stated
 as a MEASUREMENT ON A DATE and not as a standing property of the suite: as of
-this commit, ``def test_`` appears 139 times across the 7 test files, 139 are
-collected, there are no ``class Test*`` definitions and no indented test
-functions, and no test uses any construct in the unsupported list above -- the
+this commit, ``def test_`` appears 156 times across the 8 test files, 156 are
+collected, and no test uses any construct in the unsupported list above -- the
 only occurrences of the word "fixture" in the suite are in string literals and
-comments. So for THIS suite, at THIS commit, the gap between "139 collected and
-executed" and "the suite passes" is closed by inspection. **THE GAP REOPENS THE
+comments. There are **no indented test functions**, and **one** class
+definition in the suite, ``approx`` in ``tests/test_m1_profile.py``, which is a
+local comparator and not a ``class Test*``; it is therefore correctly not
+collected. That is stated rather than reported as "no classes", because "no
+classes" would have been a true-sounding summary of a tree that has one.
+
+So for THIS suite, at THIS commit, the gap between "156 collected and executed"
+and "the suite passes" is closed by inspection. **THE GAP REOPENS THE
 MOMENT SOMEONE ADDS A TEST USING A CONSTRUCT ABOVE, AND IT WILL REOPEN
 SILENTLY.** Re-run the reconciliation; do not inherit this paragraph's result.
 
@@ -94,11 +102,48 @@ USAGE
     python3 tools/laguna_phase0/run_tests.py
     python3 tools/laguna_phase0/run_tests.py --select closure
     python3 tools/laguna_phase0/run_tests.py --list
+    python3 tools/laguna_phase0/run_tests.py --even-if-pytest-is-available
 
-Exit status is 0 when every collected test passed, 1 when any failed or errored,
-and 2 when nothing was collected. **Zero collected tests is exit 2, not exit 0**
--- an empty run is UNDETERMINED and never a pass, which is the same rule the
-instruments themselves follow, and the rule R7 exists because M0 broke.
+**THE REFUSAL WHEN REAL PYTEST IS PRESENT IS A DEFAULT, NOT A GUARANTEE, AND
+``--even-if-pytest-is-available`` TURNS IT OFF.** Stated here because the first
+version of this docstring said the runner "defers to it and refuses to run"
+without qualification, and an undisclosed override makes a stated safety
+property read as absolute when it is a default. What the refusal actually
+prevents is ACCIDENTAL shadowing of a stronger tool by a weaker imitation.
+Deliberate shadowing is a supported mode; it takes an explicit flag, and every
+line this runner prints still says NOT pytest.
+
+EXIT STATUS -- SIX STATES, EACH DISTINGUISHABLE, WHICH IS THE POINT
+
+    0  every collected test passed, and at least one ran
+    1  a collected test failed or errored -- it RAN and did not pass
+    2  NOTHING WAS COLLECTED. An empty run is UNDETERMINED and never a pass,
+       the same rule the instruments follow, and the rule R7 exists because M0
+       broke it
+    3  THE RUNNER DECLINED TO RUN: real pytest is importable and the override
+       was not passed. Nothing was collected and nothing was executed
+    4  ``--list`` only: tests were collected and DELIBERATELY NOT EXECUTED
+    5  COLLECTION IS INCOMPLETE: a ``test_*.py`` on disk contributed no test.
+       No count is printed at all, because the count would be true of a
+       corpus nobody asked about
+
+**WHY 5 EXISTS AND WHY IT IS NOT A TEST.** A mutant that made ``collect`` read
+only the first test file SURVIVED THE ENTIRE SUITE, including the test written
+to catch exactly that, because that test lives in a file the truncated
+collector never reaches. The suite printed a smaller green number and no
+failure. **A completeness check that the instrument can silently exclude is not
+a check**, so the reconciliation runs inside ``run`` on every full run, before
+any count is emitted. See ``uncollected_files``.
+
+**WHY 3 AND 4 ARE NOT 2 AND NOT 0.** An undeclared-changes sweep by a
+non-author found that the refusal used to return 2 -- the same code as "nothing
+was collected" -- and that ``--list`` used to return 0, the same code as "every
+test passed", after running nothing at all. **That is the P4 defect class,
+which this package was in the middle of closing in M0 when a fresh instance of
+it shipped here.** "Could not run", "found nothing to run" and "chose not to
+run" are three different facts about the world, and a caller that cannot tell
+them apart from the exit status is being handed a number that cannot come out
+differently in the case it matters. Only 0 means a test passed.
 """
 
 from __future__ import annotations
@@ -114,6 +159,21 @@ import types
 from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 PACKAGE = "tools.laguna_phase0.tests"
+# Exit codes, named rather than written as bare integers at the return sites.
+# The three-state convention this package works under is passed / ran and did
+# not pass / could not run; 3 and 4 split "could not run" into its two distinct
+# causes, because a caller that cannot tell them apart is reading a number that
+# does not depend on which happened.
+EXIT_ALL_PASSED = 0
+EXIT_SOMETHING_FAILED = 1
+EXIT_NOTHING_COLLECTED = 2
+EXIT_DECLINED = 3
+EXIT_LISTED_ONLY = 4
+# 5 is not a variant of "something failed". Nothing failed: the runner never
+# looked at part of the corpus, so it has no result for that part and refuses
+# to publish a count that would be read as covering it.
+EXIT_COLLECTION_INCOMPLETE = 5
+
 TESTS_DIR = pathlib.Path(__file__).with_name("tests")
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
@@ -203,8 +263,36 @@ def install_pytest_stand_in() -> None:
 
 
 def real_pytest_available() -> bool:
-    spec = importlib.util.find_spec("pytest")
-    return spec is not None
+    """True only for a REAL pytest, and safe to call after the stand-in is in.
+
+    TWO WAYS THIS USED TO BE WRONG, BOTH FOUND BY THE FIRST TEST EVER WRITTEN
+    AGAINST THIS RUNNER, and both only reachable on a second call in one
+    process -- which is to say, never during a normal run and always during a
+    test of a normal run.
+
+    1. ``find_spec("pytest")`` RAISES ``ValueError: pytest.__spec__ is None``
+       once the stand-in is registered, because the stand-in is a plain module
+       object with no spec. The function did not merely return the wrong
+       answer, it blew up.
+    2. Had it not raised, a spec-bearing stand-in would have made this return
+       True and the runner would have reported real pytest as present on the
+       strength of its own imitation.
+
+    So the stand-in is recognised BY ITS MARKER FIRST, before any spec lookup.
+    """
+    installed = sys.modules.get("pytest")
+    if getattr(installed, "__laguna_phase0_stand_in__", False):
+        return False
+    if installed is not None:
+        return True
+    try:
+        return importlib.util.find_spec("pytest") is not None
+    except (ImportError, ValueError):
+        # A broken or spec-less `pytest` on the path is NOT a usable pytest.
+        # Answering False here means the fallback runs, which is the safe
+        # direction: the alternative is refusing to run over a tool that
+        # cannot be imported anyway.
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -235,14 +323,56 @@ def collect(select: Optional[str] = None) -> List[Tuple[str, str, Callable[[], A
     return found
 
 
+def uncollected_files(
+        cases: Sequence[Tuple[str, str, Callable[[], Any]]]) -> List[str]:
+    """Test files on disk that contributed no collected test.
+
+    THE COMPLETENESS CHECK CANNOT LIVE IN A TEST, AND THIS IS THE WHOLE POINT.
+    A test asserting "the collector found every file" is itself in a file the
+    collector has to find. Truncate the collector and that test is not
+    collected either, so it cannot fail -- the suite reports a clean run over a
+    smaller corpus and the number goes down silently. It was measured: a mutant
+    that made ``collect`` read only the first test file was caught by NOTHING,
+    including the test written specifically to catch it.
+
+    So the reconciliation is performed BY THE RUNNER, on every full run, before
+    any count is printed. An instrument that can only be checked by the thing
+    it is measuring is not checked.
+
+    TWO PROPERTIES, BOTH DELIBERATE, NEITHER A BUG:
+
+    * A ``test_*.py`` holding no test function at all is reported as
+      uncollected. That is wanted. A test file contributing nothing is a hole
+      of the same kind, and it is likelier to be a half-finished file than a
+      deliberate one.
+    * IT DOES NOT COVER ``--list``, which does not call ``run``. A truncated
+      collector under ``--list`` prints a shorter list and says so. ``--list``
+      never returns the code for a pass, so it cannot manufacture a green
+      result, but it CAN under-report a count to a reader who trusts it.
+    """
+    seen = {module_name for module_name, _, _ in cases}
+    return sorted(p.stem for p in TESTS_DIR.glob("test_*.py")
+                  if p.stem not in seen)
+
+
 def run(select: Optional[str] = None, verbose: bool = False) -> int:
     cases = collect(select)
+    if select is None:
+        missing = uncollected_files(cases)
+        if missing:
+            print(f"{BANNER}\nlaguna-phase0 fallback runner: COLLECTION IS "
+                  f"INCOMPLETE. {len(missing)} test file(s) on disk "
+                  f"contributed no test: {', '.join(missing)}.\n"
+                  "NO COUNT IS REPORTED. A green result over part of the "
+                  "corpus is worse than no result, because it looks like the "
+                  "whole corpus.")
+            return EXIT_COLLECTION_INCOMPLETE
     if not cases:
         print(f"{BANNER}\ncollected 0 tests"
               + (f" matching {select!r}" if select else "")
               + "\nlaguna-phase0 fallback runner: NOTHING COLLECTED -- "
                 "UNDETERMINED, not a pass")
-        return 2
+        return EXIT_NOTHING_COLLECTED
 
     print(BANNER)
     failures: List[Tuple[str, str, str]] = []
@@ -268,7 +398,7 @@ def run(select: Optional[str] = None, verbose: bool = False) -> int:
     print(f"\nlaguna-phase0 fallback runner (NOT pytest): "
           f"{passed} passed, {len(failures)} failed, {len(cases)} collected "
           f"from {len(sorted(TESTS_DIR.glob('test_*.py')))} files")
-    return 1 if failures else 0
+    return EXIT_SOMETHING_FAILED if failures else EXIT_ALL_PASSED
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -292,7 +422,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
               "supports far less. Run:\n"
               "    python3 -m pytest tools/laguna_phase0/tests\n"
               "Pass --even-if-pytest-is-available to override deliberately.")
-        return 2
+        # EXIT 3, not 2. Declining to run is not the same fact as collecting
+        # nothing, and before this was separated a caller could not tell them
+        # apart. See the EXIT STATUS block in the module docstring.
+        return EXIT_DECLINED
     if not real_pytest_available():
         install_pytest_stand_in()
 
@@ -300,8 +433,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cases = collect(args.select)
         for module_name, test_name, _ in cases:
             print(f"{module_name}::{test_name}")
-        print(f"collected {len(cases)}")
-        return 0 if cases else 2
+        print(f"collected {len(cases)} -- LISTED ONLY, NOTHING WAS EXECUTED")
+        # EXIT 4, not 0. `--list` executed no test, so it has no business
+        # returning the code that means every test passed.
+        return EXIT_LISTED_ONLY if cases else EXIT_NOTHING_COLLECTED
 
     return run(args.select, args.verbose)
 
