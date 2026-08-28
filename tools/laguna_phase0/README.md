@@ -261,3 +261,34 @@ requests already have `num_computed_tokens` at the context length, with
 `jax.block_until_ready` as the sync -- named here rather than written into the
 module, because that call sequence has never been exercised by the author and a
 guessed binding that runs is worse than an explicit seam that does not.
+
+## M4 -- `m4_router_histogram.py`
+
+Distinct experts per layer per step, at c1, c16 and c32. It costs no timed run
+and, per review finding B4, it gates the whole ranking rather than one
+candidate: its result selects the Phase 1 candidate.
+
+* **The per-layer histogram is the output**, alongside per-layer `E` and the
+  summary `E`. The summary is a verdict; the histogram is the intermediate.
+* **Every ladder point carries its basis on the point** (`router_count`) and the
+  counter's units and source next to the value.
+* **The c1 and c16 points are emitted in a form that can feed the Phase 1
+  naming statistic. This module does not compute that statistic and does not
+  name a candidate.**
+
+Acceptance:
+
+| leg | rule | source |
+|---|---|---|
+| byte model | E(32) within 10% of 183 | design section 7, M4 |
+| padding rows do NOT disperse | E(1) in the band 10-20 | design section 7, M4 |
+| padding rows DO disperse | E(1) "near 119" -- **no tolerance exists** | -- |
+
+The dispersal leg reports `COULD_NOT_BE_CHECKED_MECHANICALLY` and publishes the
+distance from 119. No named party has supplied a tolerance for "near", and
+borrowing the 10% that was designed for E(32) would be inventing one;
+`m4.e1_disperse_tolerance_fraction` is present in `thresholds.json` with value
+null and the escalation recorded in its source field.
+
+A capture that does not record whether padding rows were routed and counted
+cannot answer the padding question at all, and says so rather than answering it.

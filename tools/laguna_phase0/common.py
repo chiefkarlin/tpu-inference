@@ -166,6 +166,41 @@ class Thresholds:
 
 
 @dataclasses.dataclass(frozen=True)
+class CounterProvenance:
+    """Units and source, travelling next to a counter's value.
+
+    A downstream gate compares measured tile visits against an expected group
+    count near 183 or a row-tile count near 4 -- roughly a factor of 46 apart.
+    A units error there does not produce an implausible number; it produces a
+    confident wrong verdict that kills or resurrects a candidate. So every
+    counter read out of a profiler carries its units and where they were
+    established, IN THE OUTPUT, and ``units_confirmed=False`` when they could
+    not be established from the profiler's own documentation or output.
+
+    Units are never inferred from whether the resulting number looks
+    reasonable: a wrong-unit reading of a plausible quantity is precisely what
+    looks reasonable.
+    """
+
+    name: str
+    units: str
+    source: str
+    units_confirmed: bool
+    note: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        out = dataclasses.asdict(self)
+        if not self.units_confirmed:
+            out["units"] = f"UNKNOWN (claimed: {self.units})"
+        return out
+
+
+def counted(value: Any, provenance: CounterProvenance) -> Dict[str, Any]:
+    """One counter value with its provenance attached, ready to emit."""
+    return {"value": value, "provenance": provenance.to_dict()}
+
+
+@dataclasses.dataclass(frozen=True)
 class Check:
     """A single disposition plus everything needed to recompute it."""
 

@@ -16,7 +16,9 @@
       "note": "A run that recompiles in-window is VOID, not adjusted. There is no adjusted path in this package."
     },
     "required_env": {
-      "value": {"VLLM_XLA_CHECK_RECOMPILATION": "1"},
+      "value": {
+        "VLLM_XLA_CHECK_RECOMPILATION": "1"
+      },
       "kind": "constant",
       "source": "optimization-design.md section 7, M0",
       "note": "Recorded into the warm-up evidence of every window so a third party can see it was set."
@@ -37,8 +39,18 @@
     },
     "cells": {
       "value": [
-        {"shape": "B", "isl": 512, "osl": 256, "concurrency": 32},
-        {"shape": "B", "isl": 512, "osl": 256, "concurrency": 1}
+        {
+          "shape": "B",
+          "isl": 512,
+          "osl": 256,
+          "concurrency": 32
+        },
+        {
+          "shape": "B",
+          "isl": 512,
+          "osl": 256,
+          "concurrency": 1
+        }
       ],
       "kind": "constant",
       "source": "optimization-design.md section 7 M2 (c32); review-1 section 4.2 finding B8 (c1)"
@@ -60,7 +72,11 @@
   },
   "m4": {
     "concurrencies": {
-      "value": [1, 16, 32],
+      "value": [
+        1,
+        16,
+        32
+      ],
       "kind": "constant",
       "source": "optimization-design.md section 7, M4"
     },
@@ -70,7 +86,7 @@
       "source": "optimization-design.md section 7, M4 (byte model stands if E(32) is within 10% of 183)"
     },
     "e32_tolerance_fraction": {
-      "value": 0.10,
+      "value": 0.1,
       "kind": "constant",
       "source": "optimization-design.md section 7, M4"
     },
@@ -80,9 +96,18 @@
       "source": "optimization-design.md section 7, M4 (E(1) near 119 => padding rows disperse)"
     },
     "e1_no_disperse_band": {
-      "value": [10, 20],
+      "value": [
+        10,
+        20
+      ],
       "kind": "constant",
       "source": "optimization-design.md section 7, M4 (E(1) of 10-20 => padding rows do not disperse)"
+    },
+    "e1_disperse_tolerance_fraction": {
+      "value": null,
+      "kind": "input",
+      "source": "NOT STATED BY ANY NAMED PARTY. The design says E(1) 'near 119' without a tolerance, and the developer did not invent one; escalated to laguna-tpu-opt-em.",
+      "note": "Until a named party supplies it, the dispersal leg of M4 reports COULD_NOT_BE_CHECKED_MECHANICALLY and publishes the distance from 119 as an intermediate. The 'do not disperse' leg needs no tolerance: the design states the band 10-20 exactly."
     }
   },
   "m6": {
@@ -142,19 +167,23 @@
       "note": "Basis recorded because a reader is entitled to weigh it: 0.85 is judgement, not derived from a measurement. What is principled is the ratio-to-reference form, not the number."
     },
     "e_dec_efficiency_deficit_ratio": {
-      "value": 0.60,
+      "value": 0.6,
       "kind": "input",
       "source": "architect judgement, via brief section E6 Rule 2",
       "note": "Same basis as 0.85. A revision to either costs a parameter, by design."
     },
     "e_ref_plausibility_floor": {
-      "value": 0.50,
+      "value": 0.5,
       "kind": "input",
       "source": "architect, via brief section E6 Rule 2",
       "note": "If the measured reference efficiency comes back below this, Rule 2 is VOID rather than applied, and that is itself the finding."
     },
     "reference_step_ms": {
-      "value": {"1": 9.41, "16": 13.72, "32": 18.75},
+      "value": {
+        "1": 9.41,
+        "16": 13.72,
+        "32": 18.75
+      },
       "kind": "constant",
       "source": "brief section E6 Rule 1 table",
       "note": "REFERENCE ONLY. Not used in any verdict in this package. S is measured, and the decision is taken on the fraction I/S."
