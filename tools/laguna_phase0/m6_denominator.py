@@ -67,11 +67,40 @@ RECORDED_ENV = (
 )
 
 
+# The route whose answer negative-control leg 1 corrupts. Leg 1 perturbs
+# exactly ONE route, so that the reconciliation has something to disagree with.
+# Corrupting both routes identically would be undetectable BY DESIGN -- no
+# cross-check exists that could see it -- and a control that cannot be detected
+# is not a stronger control, it is an untestable one. Which route is corrupted
+# is therefore part of what leg 1 claims, and it is named here rather than left
+# implicit at the injection site.
+LEG_1_TARGET_ROUTE = "jax_device_coords"
+
+
 class Basis(str, enum.Enum):
     """Which denominator a figure is expressed against."""
 
     PER_CHIP = "per_chip"
     PER_DEVICE = "per_device"
+
+
+class ControlResponse(str, enum.Enum):
+    """Whether a negative control's corruption changed the instrument's answer.
+
+    THIS IS NOT AN OUTCOME AND IT IS NOT A VERDICT. It answers one question and
+    only that question: *did the instrument say something different because of
+    the corruption?* A control that cannot move the instrument's answer has not
+    been shown to work, whatever answer the instrument happened to give.
+
+    ``UNDEMONSTRABLE`` and ``NOT_EXERCISED`` are both "could not be checked
+    mechanically" for this purpose. Neither is a pass, and neither may be
+    reported as one.
+    """
+
+    DETECTED = "detected"
+    NOT_DETECTED = "not-detected"
+    NOT_EXERCISED = "not-exercised"
+    UNDEMONSTRABLE = "undemonstrable"
 
 
 class DenominatorAssertionError(RuntimeError):
@@ -185,9 +214,19 @@ class Injection:
     """Deliberate corruptions, for the negative controls. None are executed.
 
     Attributes:
-      chip_count_scale: Leg 1. Multiplies the derived chip count. Expressed as
-        a scale rather than as a literal so that no artifact in this repository
-        ever contains a device count written as a chip count.
+      chip_count_scale: Leg 1. Multiplies ONE route's derived chip count --
+        :data:`LEG_1_TARGET_ROUTE` -- and then leaves the reconciliation alone
+        to reach whatever verdict it reaches. Expressed as a scale rather than
+        as a literal so that no artifact in this repository ever contains a
+        device count written as a chip count.
+
+        BEFORE ROUND 1 THIS LEG WROTE ITS OWN FAILED VERDICT (review finding
+        R5). It perturbed the value *and* asserted the answer, so it reported
+        FAILED even for a scale of 1.0, and it would still have reported FAILED
+        with the entire reconciliation deleted. It could not come out any other
+        way, which is the definition of a control that has not been shown to
+        work. It now corrupts an INPUT only; see :func:`adjudicate_leg_1` for
+        how the response is measured rather than declared.
       inconsistent_pairing: Leg 2, the one that matters. Halves the FLOPs side
         only, leaving bandwidth per-chip: per-device FLOPs against per-chip
         bandwidth.
@@ -246,6 +285,38 @@ class Injection:
                                    hbm_bandwidth_gbytes_per_s=bandwidth,
                                    flops_basis=flops_basis,
                                    bandwidth_basis=bandwidth_basis)
+
+    def apply_to_evidence(
+            self,
+            evidence: Sequence["ChipCountEvidence"]) -> List["ChipCountEvidence"]:
+        """Leg 1: corrupt the INPUT to the reconciliation, never its verdict.
+
+        The corruption stops here. Nothing downstream of this method is told
+        that an injection happened, so every check that follows reaches its
+        verdict from the numbers alone -- which is the only arrangement in
+        which the verdict is evidence that the checks work.
+
+        A route that produced no answer is left alone: there is no value to
+        scale, and manufacturing one would be inventing the very thing the
+        route refused to guess at.
+        """
+        if self.chip_count_scale is None:
+            return list(evidence)
+        out: List["ChipCountEvidence"] = []
+        for item in evidence:
+            if item.route != LEG_1_TARGET_ROUTE or item.chip_count is None:
+                out.append(item)
+                continue
+            scaled = int(round(item.chip_count * self.chip_count_scale))
+            detail = dict(item.detail)
+            detail["negative_control_leg_1"] = {
+                "route_corrupted": item.route,
+                "scale": self.chip_count_scale,
+                "chip_count_before_injection": item.chip_count,
+                "chip_count_after_injection": scaled,
+            }
+            out.append(ChipCountEvidence(item.route, scaled, detail))
+        return out
 
 
 @dataclasses.dataclass
@@ -356,6 +427,108 @@ def reconcile_chip_count(evidence: Sequence[ChipCountEvidence]) -> Tuple[Optiona
                                f"both routes agree on {count} chips", intermediates)
 
 
+def adjudicate_leg_1(
+        *,
+        scale: Optional[float],
+        raw_evidence: Sequence[ChipCountEvidence],
+        injected_evidence: Sequence[ChipCountEvidence],
+        baseline: Tuple[Optional[int], common.Check],
+        corrupted: Tuple[Optional[int], common.Check]) -> Optional[Dict[str, Any]]:
+    """Measures whether leg 1's corruption changed the reconciliation's answer.
+
+    THE CONTROL'S RESULT IS A DIFFERENCE BETWEEN TWO REAL RUNS OF THE SAME
+    DETECTOR, on the uncorrupted and the corrupted input. That is the whole
+    repair for R5. A difference cannot be hand-written the way a verdict can:
+    to report DETECTED, the detector has to have passed the clean input and
+    refused the dirty one, and if the detector were deleted both runs would
+    return the same thing and this would report NOT_DETECTED.
+
+    The question it answers is the standing one: WHAT INPUT WOULD MAKE THIS SAY
+    SOMETHING ELSE? All four responses below are answers to it.
+
+    Args:
+      scale: ``Injection.chip_count_scale``. ``None`` means the leg is not
+        active and there is nothing to adjudicate.
+      raw_evidence: The routes' answers before the injection.
+      injected_evidence: The same routes after it.
+      baseline: ``reconcile_chip_count(raw_evidence)``.
+      corrupted: ``reconcile_chip_count(injected_evidence)``.
+
+    Returns:
+      ``None`` when the leg is inactive, otherwise a record carrying the
+      response, the reason, and both reconciliations' outcomes.
+
+    ON REACHABILITY, STATED RATHER THAN LEFT TO BE DISCOVERED. Through
+    :func:`assert_denominator` as the routes stand today, ``NOT_DETECTED``
+    cannot occur: any scale that moves the value makes the two routes disagree,
+    and disagreement is FAILED. That is a property of there being exactly two
+    routes and no preference between them, NOT a property of this function, and
+    it would stop holding the moment a third route, a tie-break or a preferred
+    route is added. It is reachable here, and it is exercised directly by
+    ``test_the_leg_1_adjudicator_reports_a_blind_detector``, because a branch
+    that has never been executed is not a branch anyone should rely on.
+    """
+    if scale is None:
+        return None
+    baseline_count, baseline_check = baseline
+    corrupted_count, corrupted_check = corrupted
+    moved = [{
+        "route": before.route,
+        "before": before.chip_count,
+        "after": after.chip_count,
+    } for before, after in zip(raw_evidence, injected_evidence)
+             if before.chip_count != after.chip_count]
+
+    record: Dict[str, Any] = {
+        "leg": "leg 1: chip count",
+        "scale": scale,
+        "target_route": LEG_1_TARGET_ROUTE,
+        "routes_moved": moved,
+        "reconciliation_without_injection": {
+            "outcome": baseline_check.outcome.value,
+            "chip_count": baseline_count,
+            "reason": baseline_check.reason,
+        },
+        "reconciliation_with_injection": {
+            "outcome": corrupted_check.outcome.value,
+            "chip_count": corrupted_count,
+            "reason": corrupted_check.reason,
+        },
+    }
+
+    if not moved:
+        record["response"] = ControlResponse.NOT_EXERCISED.value
+        record["why"] = (
+            f"a scale of {scale} left every route's answer unchanged, so no "
+            "detector was put under test. Nothing was corrupted and nothing "
+            "can be concluded: this is UNDETERMINED for the control, and it is "
+            "not a pass. Before round 1 this same input reported FAILED.")
+    elif baseline_check.outcome is not common.Outcome.PASSED:
+        record["response"] = ControlResponse.UNDEMONSTRABLE.value
+        record["why"] = (
+            "the reconciliation did not pass on the UNCORRUPTED input either "
+            f"({baseline_check.outcome.value}: {baseline_check.reason}), so a "
+            "non-passing result on the corrupted input demonstrates nothing -- "
+            "the answer was already non-passing before the corruption arrived. "
+            "The commonest cause is a single live route, which is also the "
+            "case in which the corrupted count would flow onward unchallenged.")
+    elif corrupted_check.outcome is common.Outcome.PASSED:
+        record["response"] = ControlResponse.NOT_DETECTED.value
+        record["why"] = (
+            "the reconciliation passed the clean input and passed the "
+            "corrupted one too. THE DETECTOR IS BLIND TO THIS CORRUPTION and "
+            "the chip count it reports is the injected one. This is a finding "
+            "about the instrument, not a failure of the control.")
+    else:
+        record["response"] = ControlResponse.DETECTED.value
+        record["why"] = (
+            "the reconciliation PASSED on the uncorrupted input and returned "
+            f"{corrupted_check.outcome.value} on the corrupted one. The "
+            "verdict was reached by the detector from the numbers; the "
+            "injection wrote no outcome and touched no check.")
+    return record
+
+
 def check_basis_labels(supplied: RooflineBasis) -> common.Check:
     """Both halves must claim the per-chip basis. Labels can lie; see the ridge."""
     intermediates = {"supplied": supplied.to_dict()}
@@ -442,6 +615,13 @@ class DenominatorReport:
     basis: RooflineBasis
     pinned: RooflineBasis
     injection: Injection
+    # The leg 1 control record, or None when leg 1 was not active. It is
+    # DELIBERATELY NOT A Check AND IS NOT IN `checks`: it answers "did the
+    # corruption move the detector", which is a different question from "is
+    # this run's denominator sound", and folding the two would let a control
+    # result decide a run's outcome. It is published; it is not adjudicated
+    # into the outcome.
+    leg_1_control: Optional[Dict[str, Any]] = None
 
     @property
     def outcome(self) -> common.Outcome:
@@ -453,6 +633,7 @@ class DenominatorReport:
             "supplied_basis": self.basis.to_dict(),
             "pinned_basis": self.pinned.to_dict(),
             "injection": dataclasses.asdict(self.injection),
+            "negative_control_leg_1": self.leg_1_control,
         }
 
 
@@ -486,22 +667,23 @@ def assert_denominator(*,
     pinned = pinned_basis(thresholds)
     basis = injection.apply_to_basis(supplied or pinned)
 
-    evidence = [
+    raw_evidence = [
         chip_count_from_coords(views, devices_per_chip),
         chip_count_from_gke(gke_allocation, gke_allocation_unit, devices_per_chip),
     ]
-    chip_count, count_check = reconcile_chip_count(evidence)
-    if chip_count is not None and injection.chip_count_scale is not None:
-        scaled = int(round(chip_count * injection.chip_count_scale))
-        count_check = common.check(
-            "m6.chip_count", common.Outcome.FAILED,
-            "negative control leg 1: the derived chip count was overridden by a "
-            f"scale factor of {injection.chip_count_scale}",
-            {
-                **count_check.intermediates, "derived_chip_count": chip_count,
-                "injected_chip_count": scaled
-            })
-        chip_count = scaled
+    # R5. Leg 1 corrupts an input and then gets out of the way. The
+    # reconciliation runs twice on the same code path -- once clean, once
+    # dirty -- and the control's result is the DIFFERENCE, which is measured
+    # below and not asserted here. When the leg is inactive the two calls are
+    # given identical input and `adjudicate_leg_1` returns None.
+    injected_evidence = injection.apply_to_evidence(raw_evidence)
+    baseline = reconcile_chip_count(raw_evidence)
+    chip_count, count_check = reconcile_chip_count(injected_evidence)
+    leg_1 = adjudicate_leg_1(scale=injection.chip_count_scale,
+                             raw_evidence=raw_evidence,
+                             injected_evidence=injected_evidence,
+                             baseline=baseline,
+                             corrupted=(chip_count, count_check))
 
     checks = [
         count_check,
@@ -516,7 +698,8 @@ def assert_denominator(*,
                                checks=checks,
                                basis=basis,
                                pinned=pinned,
-                               injection=injection)
+                               injection=injection,
+                               leg_1_control=leg_1)
     if raise_on_failure and report.outcome is not common.Outcome.PASSED:
         reasons = "; ".join(f"{c.name}={c.outcome.value}: {c.reason}"
                             for c in checks
@@ -579,17 +762,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                           thresholds=thresholds,
                           # Reached only after assert_denominator returned, and
                           # assert_denominator is where the injection is applied
-                          # (basis at line 487, chip count at 494). So on this
+                          # -- `apply_to_basis` for leg 2, `apply_to_evidence`
+                          # for leg 1, both named rather than cited by a line
+                          # number that the next edit invalidates. So on this
                           # path an ACTIVE injection has by construction already
                           # run, and `executed` says so. `as_negative_control`
                           # still returns None when the injection is inactive,
                           # so this cannot claim a firing that did not happen.
+                          # NOTE that `executed=True` says the leg RAN. Whether
+                          # it DETECTED anything is a separate finding and is
+                          # in the payload under `negative_control_leg_1`.
                           negative_control=injection.as_negative_control(
                               executed=True),
                           extra_provenance={"env": common.env_snapshot(RECORDED_ENV)})
     print(f"M6: {report.outcome.value}; artifact written to {args.out}")
     for item in report.checks:
         print(f"  {item.name}: {item.outcome.value} -- {item.reason}")
+    if report.leg_1_control is not None:
+        # The control's response goes to the headline channel, because a
+        # control result that only reaches the artifact is a control result
+        # nobody reads. It is printed as its own line and NOT merged into the
+        # outcome line above: the run's outcome and the control's response are
+        # two different measurements and the exit status carries neither.
+        print(f"  NEGATIVE CONTROL leg 1: {report.leg_1_control['response']} "
+              f"-- {report.leg_1_control['why']}")
     return 0 if report.outcome is common.Outcome.PASSED else 1
 
 

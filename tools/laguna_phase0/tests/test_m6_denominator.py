@@ -242,3 +242,156 @@ def test_the_m6_control_descriptor_defaults_to_not_executed():
 def test_an_inactive_injection_has_no_control_even_when_told_it_executed():
     """`executed=True` must not conjure a control out of an uncorrupted run."""
     assert m6.Injection().as_negative_control(executed=True) is None
+
+
+# --------------------------------------------------------------------------
+# R5 -- LEG 1 MUST NOT WRITE ITS OWN VERDICT.
+#
+# Every test below fails against the pre-fix module, and the reasons differ,
+# which is the point: one demonstrates that the old leg reported a failure with
+# nothing corrupted, one that its verdict came from the injection rather than
+# from the detector, and one that the blind-detector branch is reachable at all.
+# --------------------------------------------------------------------------
+
+
+def two_agreeing_routes(**kwargs):
+    """A clean, PASSING reconciliation: both routes live and in agreement.
+
+    The tensor-parallel size is read from the pinned ceiling rather than
+    written here, so that this helper cannot drift into asserting a size the
+    thresholds no longer permit.
+    """
+    th = thresholds()
+    return dict(views=chiplets(FOUR_CHIPS),
+                thresholds=th,
+                gke_allocation=4,
+                gke_allocation_unit="chips",
+                tensor_parallel_size=int(th.require("m6.max_tensor_parallel_size")),
+                **kwargs)
+
+
+def test_leg_1_verdict_is_reached_by_the_reconciliation_not_by_the_injection():
+    """The FAILED must be route disagreement, in the detector's own words.
+
+    Pre-fix this reason read "negative control leg 1: the derived chip count
+    was overridden by a scale factor of 2.0" -- the injection announcing its own
+    result. The detector was never consulted and would not have been missed.
+    """
+    with pytest.raises(m6.DenominatorAssertionError):
+        m6.assert_denominator(**two_agreeing_routes(
+            injection=m6.Injection(chip_count_scale=2.0)))
+    report = m6.assert_denominator(
+        **two_agreeing_routes(injection=m6.Injection(chip_count_scale=2.0),
+                              raise_on_failure=False))
+    count_check = [c for c in report.checks if c.name == "m6.chip_count"][0]
+    assert count_check.outcome is common.Outcome.FAILED
+    assert "routes disagree" in count_check.reason
+    assert "negative control" not in count_check.reason.lower()
+    assert report.leg_1_control["response"] == m6.ControlResponse.DETECTED.value
+
+
+def test_leg_1_that_corrupts_nothing_reports_nothing_detected():
+    """A scale that does not move the value must not report a detection.
+
+    THIS IS THE TEST THAT PINS THE OLD DEFECT MOST DIRECTLY. A scale of 1.0
+    changes no input at all, yet the pre-fix leg still wrote FAILED and still
+    stopped the run. An instrument that reports a caught corruption when there
+    was no corruption is not a strict instrument, it is a broken one, and it is
+    the same shape as an instrument that cannot report one.
+    """
+    report = m6.assert_denominator(**two_agreeing_routes(
+        injection=m6.Injection(chip_count_scale=1.0)))
+    assert report.outcome is common.Outcome.PASSED
+    assert report.chip_count == 4
+    assert report.leg_1_control["response"] == m6.ControlResponse.NOT_EXERCISED.value
+    assert report.leg_1_control["routes_moved"] == []
+
+
+def test_leg_1_rounding_back_to_the_same_count_is_also_not_exercised():
+    """The near-miss of the case above: 1.1 x 4 rounds back to 4."""
+    report = m6.assert_denominator(**two_agreeing_routes(
+        injection=m6.Injection(chip_count_scale=1.1)))
+    assert report.outcome is common.Outcome.PASSED
+    assert report.leg_1_control["response"] == m6.ControlResponse.NOT_EXERCISED.value
+
+
+def test_leg_1_corrupts_one_route_only_and_leaves_the_other_alone():
+    """Corrupting both routes identically would be undetectable by design."""
+    raw = [
+        m6.chip_count_from_coords(chiplets(FOUR_CHIPS), DEVICES_PER_CHIP),
+        m6.chip_count_from_gke(4, "chips", DEVICES_PER_CHIP),
+    ]
+    injected = m6.Injection(chip_count_scale=2.0).apply_to_evidence(raw)
+    clean = {e.route: e.chip_count for e in raw}
+    by_route = {e.route: e.chip_count for e in injected}
+    # Written as a multiple of the clean value, never as a literal count: the
+    # scale exists precisely so that no file here states a device count under a
+    # chip count's name, and a test file is a file.
+    assert by_route[m6.LEG_1_TARGET_ROUTE] == clean[m6.LEG_1_TARGET_ROUTE] * 2
+    assert by_route["gke_allocation"] == clean["gke_allocation"]
+
+
+def test_leg_1_does_not_invent_an_answer_for_a_route_that_abstained():
+    """No value to scale is not a licence to supply one."""
+    raw = [m6.chip_count_from_coords([], DEVICES_PER_CHIP)]
+    injected = m6.Injection(chip_count_scale=2.0).apply_to_evidence(raw)
+    assert injected[0].chip_count is None
+    assert "negative_control_leg_1" not in injected[0].detail
+
+
+def test_leg_1_on_a_single_route_is_undemonstrable_not_a_detection():
+    """One live route: the clean run does not pass either, so nothing is shown.
+
+    And the honest consequence is recorded rather than glossed -- on this
+    topology the corrupted count is what the reconciliation carries forward.
+    """
+    report = m6.assert_denominator(views=chiplets(FOUR_CHIPS),
+                                   thresholds=thresholds(),
+                                   injection=m6.Injection(chip_count_scale=2.0),
+                                   raise_on_failure=False)
+    assert report.outcome is common.Outcome.UNDETERMINED
+    assert report.leg_1_control["response"] == m6.ControlResponse.UNDEMONSTRABLE.value
+    assert (report.leg_1_control["reconciliation_with_injection"]["chip_count"]
+            == len(FOUR_CHIPS) * 2)
+
+
+def test_no_leg_1_record_at_all_when_the_leg_is_not_active():
+    """Absent must mean absent. A control record for an unrun control is a lie."""
+    report = m6.assert_denominator(**two_agreeing_routes())
+    assert report.leg_1_control is None
+    assert report.payload()["negative_control_leg_1"] is None
+
+
+def test_the_leg_1_adjudicator_reports_a_blind_detector():
+    """The NOT_DETECTED branch, exercised directly.
+
+    It is unreachable through `assert_denominator` today because two routes
+    with no preference between them always disagree once one moves. That is a
+    property of the routes, not of the adjudicator, and it stops holding the
+    moment a third route or a tie-break is added. So the branch is driven here
+    with a detector that passes both inputs -- a branch nobody has ever run is
+    not a branch anybody should rely on.
+    """
+    clean_count = len(FOUR_CHIPS)
+    dirty_count = clean_count * 2
+    raw = [m6.ChipCountEvidence("jax_device_coords", clean_count, {})]
+    injected = [m6.ChipCountEvidence("jax_device_coords", dirty_count, {})]
+    passing = common.check("m6.chip_count", common.Outcome.PASSED, "a blind detector", {"routes": "hand-built"})
+    record = m6.adjudicate_leg_1(scale=2.0,
+                                 raw_evidence=raw,
+                                 injected_evidence=injected,
+                                 baseline=(clean_count, passing),
+                                 corrupted=(dirty_count, passing))
+    assert record["response"] == m6.ControlResponse.NOT_DETECTED.value
+    assert "BLIND" in record["why"]
+
+
+def test_the_leg_1_adjudicator_is_silent_when_the_leg_is_inactive():
+    """The empty case of the adjudicator itself: no scale, no record."""
+    raw = [m6.ChipCountEvidence("jax_device_coords", 4, {})]
+    passing = common.check("m6.chip_count", common.Outcome.PASSED, "clean", {"routes": "hand-built"})
+    assert m6.adjudicate_leg_1(scale=None,
+                               raw_evidence=raw,
+                               injected_evidence=raw,
+                               baseline=(4, passing),
+                               corrupted=(4, passing)) is None

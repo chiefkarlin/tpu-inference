@@ -134,6 +134,39 @@ Leg 1 is expressed as a scale factor rather than a literal count so that no
 artifact in this repository ever contains a device count written as a chip
 count.
 
+**What leg 1 was before round 1, and what it is now (review finding R5).** It
+used to perturb the chip count *and* write `FAILED` into the chip-count check
+itself. It would have reported `FAILED` with the entire reconciliation deleted,
+and it reported `FAILED` for a scale of 1.0, which corrupts nothing. It could
+not come out any other way, so it was not evidence that the denominator
+assertion works.
+
+It now corrupts one route's answer -- `jax_device_coords` -- and stops. The
+reconciliation then runs twice on the same code path, once on the clean
+evidence and once on the corrupted evidence, and **the control's result is the
+difference between the two answers**, reported as one of four responses:
+
+| response | means |
+|---|---|
+| `detected` | clean input PASSED, corrupted input did not. The detector moved. |
+| `not-detected` | both passed. The detector is blind to this corruption; that is a finding about the instrument. |
+| `not-exercised` | no route's answer actually changed, so nothing was under test. Not a pass. |
+| `undemonstrable` | the clean input did not pass either, so a non-passing dirty run shows nothing. Not a pass. |
+
+The response is printed on its own line by `main()` and stored in the artifact
+under `negative_control_leg_1`. **It is not a `Check` and it does not enter the
+run's outcome**: "did the corruption move the detector" and "is this run's
+denominator sound" are different questions, and the exit status answers
+neither. Only one route is corrupted, deliberately: corrupting both identically
+is undetectable by design, because no cross-check exists that could see it.
+
+**Two honest limits.** Leg 1 still exercises the least consequential input --
+that is unchanged, and it is the reason leg 2 is the leg that matters. And with
+a single live route the response is `undemonstrable`, because the clean run is
+already UNDETERMINED; on that topology the corrupted count is what the
+reconciliation carries forward, and the record says so rather than reporting a
+detection.
+
 **Neither leg has been executed.** They need real JAX coordinates on a real
 pod, so they are exactly the class that cannot be made to fail without a run.
 
