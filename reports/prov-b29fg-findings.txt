@@ -1,0 +1,55 @@
+B29-F / B29-G: DOES NOT DISTURB MY DELIVERABLE (32db88a0). Four measurements, two of
+them refutations of my own hypotheses. No instruction requested; reporting and stopping.
+
+MY OWN GATE RECEIPT, read the way B29-G says to read it (declared field, not derived):
+  run-20260828T212445Z-laguna-tpu-opt-prov-2997.out
+  total 16521 | delta +9417 | DECLARED PROJECTION 3045 | MODE: SHORT | rc 0, unpiped.
+  The subtraction everyone used gives 16521-9417 = 7104 against a declared 3045.
+  Overstatement 4059 = one duplicate copy of stdout (3045) + 1014 framing. That is
+  B29-F's "~4056" and gateadv's file = 2*stdout + delta + framing, reproduced on a run
+  neither of you sampled. Framing 1014 sits inside gateadv's 809..2003 band. THAT PART
+  STANDS. I add nothing to it beyond an independent point.
+
+1. THE 84 IS STABLE, AND THIS IS THE ONE ACTIONABLE ITEM.
+   At this path NOW: 1177 receipts, 1093 carry the declared projection field, 84 do not.
+   gateadv's census was 1081 + 84 = 1165. TWELVE NEW RECEIPTS HAVE LANDED SINCE, AND ALL
+   TWELVE CARRY THE FIELD. So the unevaluated set is still EXACTLY 84 -- it is not a
+   moving denominator. opt: your reshaped dispatch has a stable target. Controls: live
+   1093, absent-token floor 0 of 1177.
+
+2. I WAS WRONG TWICE, BOTH TIMES OFF A SUMMARY VIEW OF THE RIGHT ARTEFACT.
+   My delta +9417 is in B29-C's published family and I never reported a delta to anyone,
+   so I inferred a collision meaning the delta was near-constant and could not be the
+   field absorbing the variance. Measured: 137 DISTINCT delta values over 359 files, mine
+   shared by 3. Ordinary pigeonhole. HYPOTHESIS REFUTED.
+   I then read the top-12-by-frequency view, saw a tight 9309..9439 cluster, and inferred
+   a ~165-byte band too narrow to absorb stdout's 2447. Measured over the full range:
+   delta min 1311 max 16606, SPREAD 15295. HYPOTHESIS REFUTED, in the opposite direction.
+   THE FINDING IS THE INSTRUMENT: a frequency-ranked head is not a distribution. Sorting
+   by count shows you the mode and hides the tails, and both of my errors came from
+   reading it as though it were the spread. This is gateadv's shape exactly -- I went to
+   the artefact and then read a summary OF the artefact. GOING TO THE PRIMARY SOURCE AND
+   THEN AGGREGATING IT YOURSELF REINTRODUCES EVERY RISK THE VISIT WAS MEANT TO RETIRE.
+
+3. A LIVE FALSE-POSITIVE TRAP ON G1, WHICH I ALMOST WALKED INTO.
+   Substring 'full-stdout' matches 359 receipts. GATE STDOUT MODE: FULL matches 0.
+   The 359 is the gate's own notice text naming the flag, not an invocation -- and 359 is
+   exactly the delta-bearing count, which is the tell. Anyone auditing G1 compliance by
+   grepping the flag name gets 359 false positives pointing at "everyone is using it".
+   This is runop's finding generalised: CLASSIFY ON THE MODE FIELD, WHICH HAS A VALUE.
+   On that field I corroborate em-2 independently: FULL 0, and em-2's 339 SHORT is now
+   359 -- the count grew with new runs, the zero did not.
+   G1/G2 noted and binding. I have never invoked --full-stdout and will not; if I ever
+   have a reason I will ask first.
+
+4. ON 3(a), THE LOAD-BEARING UNKNOWN -- I AM NOT ANSWERING IT, ONLY SCOPING IT.
+   Whether R31's 8192 governs a single write or a cumulative total cannot be settled from
+   these receipts at all: every one of them is from inside SHORT mode, so they are
+   downstream of the cap and silent about the buffer. That is gateadv's own enclosure
+   objection applied one level further out. Answering it needs the capping code or a
+   fixture, and nobody has read the code. I have no authorisation for a fixture and am
+   not requesting one.
+
+NOTHING HERE TOUCHES 32db88a0. 0 occurrences of the false pipe mechanism; my run was
+unpiped, MODE SHORT, projection 3045, well under 4096; commit verified four ways against
+MYCOMMIT. The provenance findings stand as delivered.
