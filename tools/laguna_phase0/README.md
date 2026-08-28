@@ -126,3 +126,62 @@ count.
 
 **Neither leg has been executed.** They need real JAX coordinates on a real
 pod, so they are exactly the class that cannot be made to fail without a run.
+
+## M0 -- `m0_warm_cache.py`
+
+Warm-up before every timed window over the **same padding buckets the window
+will use**, `VLLM_XLA_CHECK_RECOMPILATION=1`, and zero recompilation events
+inside the window.
+
+**A window that recompiles is VOID, not adjusted.** There is no adjusted path in
+the module: nothing subtracts the compile time, annotates it, or carries the
+window forward with a caveat.
+
+**Warmth is per pod and per configuration.** The compile cache is on an
+emptyDir, so it does not survive a pod restart; and a configuration change
+alters the compiled graph set, so a pod warmed under one configuration is not
+warm under the next. `warmth_identity()` fingerprints both, and the identity
+travels in the evidence.
+
+Warm-up evidence is emitted per window, not asserted: which buckets were warmed
+and when, the warmth identity, the environment the protocol depends on, and the
+recompilation counter's reading at window start and at window end.
+
+Harness usage:
+
+```python
+ledger = WarmupLedger(plan, RecompilationProbe(counter=engine.recompilation_count),
+                      configuration=launch_args)
+ledger.warm_all(lambda bucket: engine.warm(bucket))
+with ledger:            # the timed window
+    ...
+checks = evaluate_window(ledger.evidence, thresholds)
+verdict = window_verdict(checks)     # VALID / VOID / COULD_NOT_BE_CHECKED_MECHANICALLY
+```
+
+Offline: `m0_warm_cache.py plan --bucket decode_tokens=32 --out plan.json` and
+`m0_warm_cache.py evaluate --evidence ev.json --out m0.json`.
+
+### The counter binding is unconfirmed, and says so
+
+The probe prefers an in-process counter supplied by the harness. Its fallback is
+a log scan whose patterns live in `thresholds.json` as
+`m0.recompilation_event_log_patterns`, **value null**: no log from a warmed v7x
+pod has been read by the author. With neither source the probe returns no
+reading and the window is UNDETERMINED -- not zero events. "I saw no evidence"
+and "I have evidence of none" are different statements and only one of them
+supports a claim.
+
+### Negative control (review finding B7-ii) -- NOT EXECUTED
+
+```sh
+python -m tools.laguna_phase0.m0_warm_cache plan \
+    --bucket decode_tokens=32 --bucket decode_tokens=64 \
+    --nc-leave-bucket-unwarmed decode_tokens=64 --out plan.json
+```
+
+The window then uses a bucket that was never warmed, compiles in flight, and is
+marked VOID on two independent grounds (the unwarmed bucket and the advancing
+counter). M0 gates strictly more than M6 does -- it is a precondition of every
+criterion in the design -- and until this control has been run on hardware **M0
+is written, not adopted.**
