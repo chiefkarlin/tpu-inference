@@ -43,6 +43,52 @@ Every line it prints names itself, and the summary line says
 point of R10 is that a reader must be able to tell which instrument produced a
 count without being told separately.
 
+WHAT IT CANNOT DO -- THE EXHAUSTIVE LIST, AND WHAT A COUNT FROM IT MAY CLAIM
+
+This list is here, and not only in the fix document, because a reader who runs
+this file must be able to find its limits without knowing that any other
+document exists.
+
+Unsupported, and a test using any of these will ERROR or be silently skipped
+rather than quietly "pass":
+
+* fixtures of every kind, including ``@pytest.fixture``, and therefore all of
+  the builtin fixtures -- ``tmp_path``, ``tmp_path_factory``, ``monkeypatch``,
+  ``capsys``, ``capfd``, ``caplog``, ``recwarn``, ``request``
+* ``@pytest.mark.parametrize``, and marks generally -- ``skip``, ``skipif``,
+  ``xfail``, ``usefixtures``, and any custom mark
+* ``conftest.py``: NOT read at all, at any level
+* plugins, and anything from ``pytest.ini`` / ``pyproject.toml`` /
+  ``setup.cfg`` -- no configuration file of any kind is consulted
+* test CLASSES: ``class Test*`` is NOT collected. Only module-level functions
+  named ``test_*`` in files named ``test_*.py`` are collected
+* setup/teardown of any flavour -- ``setup_function``, ``setup_module``,
+  ``setUp``, and ``unittest.TestCase`` entirely
+* assertion introspection. A failing ``assert`` reports the exception, NOT
+  pytest's expression rewriting showing the operand values
+* ``pytest.approx`` on anything but a SCALAR (rel=1e-6, abs=1e-12); no
+  sequences, dicts or numpy arrays
+* ``pytest.raises`` other than as a CONTEXT MANAGER, and it takes no ``match=``
+
+SO THE HONEST CLAIM A COUNT FROM THIS RUNNER SUPPORTS is: "these N module-level
+test functions were collected and executed by the fallback runner, and none
+raised." IT DOES NOT SUPPORT "the test suite passes", because a suite that uses
+any construct above is not fully collected here, and a construct this runner
+skips is INVISIBLE rather than red. **CHECK THE COLLECTED COUNT AGAINST THE
+NUMBER OF ``def test_`` LINES IN THE TREE BEFORE BELIEVING A GREEN RESULT** --
+use ``--list``. An honest untested beats an unreproducible 37-of-37.
+
+That reconciliation was run on this tree rather than assumed, and it is stated
+as a MEASUREMENT ON A DATE and not as a standing property of the suite: as of
+this commit, ``def test_`` appears 139 times across the 7 test files, 139 are
+collected, there are no ``class Test*`` definitions and no indented test
+functions, and no test uses any construct in the unsupported list above -- the
+only occurrences of the word "fixture" in the suite are in string literals and
+comments. So for THIS suite, at THIS commit, the gap between "139 collected and
+executed" and "the suite passes" is closed by inspection. **THE GAP REOPENS THE
+MOMENT SOMEONE ADDS A TEST USING A CONSTRUCT ABOVE, AND IT WILL REOPEN
+SILENTLY.** Re-run the reconciliation; do not inherit this paragraph's result.
+
 USAGE
 
     python3 tools/laguna_phase0/run_tests.py
