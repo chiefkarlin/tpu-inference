@@ -37,6 +37,7 @@ class MeasurementBasis(str, enum.Enum):
     """What a number was measured against. Never inferred, always declared."""
 
     WALL_CLOCK = "wall_clock"
+    ENGINE_STEP_WALL_CLOCK = "engine_step_wall_clock"
     TPOT_DERIVED = "tpot_derived"
     DEVICE_TIMELINE = "device_timeline"
     ROUTER_COUNT = "router_count"
@@ -95,6 +96,25 @@ def require_single_basis(points: Sequence[LadderPoint]) -> MeasurementBasis:
             "points are on more than one basis: "
             f"{sorted(b.value for b in bases)}; mixing them is review finding B3")
     return bases.pop()
+
+
+def declare_cross_basis(left: LadderPoint, right: LadderPoint,
+                        why: str) -> Dict[str, Any]:
+    """Records a comparison that crosses bases ON PURPOSE.
+
+    Some comparisons are cross-basis by construction -- the serving-stack cost
+    is precisely an engine-step wall-clock time subtracted from a TPOT-derived
+    one, and the crossing is the measurement rather than a mistake. Those go
+    through here, which writes the crossing into the artifact in words, so that
+    the difference between a deliberate crossing and review finding B3 is
+    visible to a reader instead of resting on the author's intent.
+    """
+    return {
+        "cross_basis_comparison": True,
+        "left_basis": left.basis.value,
+        "right_basis": right.basis.value,
+        "why_this_crossing_is_deliberate": why,
+    }
 
 
 def ladder_to_dicts(points: Iterable[LadderPoint]) -> List[Dict[str, Any]]:

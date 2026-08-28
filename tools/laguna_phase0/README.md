@@ -212,3 +212,52 @@ point that cannot be combined with anything.
 `plan` renders the replicate invocations without running them; `summarise`
 ingests the results, and requires `--basis` on the command line because an
 ingest that guesses the basis reintroduces the defect.
+
+## M3 -- `m3_decode_microbench.py`
+
+Fixed batch, pre-filled KV, no HTTP and no prefill inside the timed window, so
+that engine step time can be separated from serving-stack overhead.
+
+**The 1 ms threshold in the design is not implemented and cannot be read.**
+Review finding B8 rules that a 1 ms threshold on a TPOT-derived quantity, with
+no spread estimate anywhere, violates M2's own rule. So:
+
+* the difference between engine step time and served TPOT is emitted as an
+  intermediate, always;
+* the verdict needs `m3.serving_stack_cost_threshold_ms`, which is **null** in
+  `thresholds.json` and must be derived from M2's measured spread at the same
+  cell;
+* with no threshold the outcome is `COULD_NOT_BE_CHECKED_MECHANICALLY`, and
+  that is the expected outcome today;
+* a supplied threshold *finer than the measured spread* is refused, for the same
+  reason the 1 ms one was.
+
+The design's 1 ms sits in `thresholds.json` as kind `rejected`, value null, so
+no code path can read it.
+
+Two enforced properties:
+
+* **A device sync is required.** JAX dispatch is asynchronous, so an unsynced
+  step loop measures dispatch rather than execution -- and reports it as
+  impossibly fast, which is the flattering direction. `run_step_loop` raises
+  without one.
+* **The cross-basis comparison is declared.** Engine-step wall clock against
+  served TPOT is the measurement, not a mistake, so it goes through
+  `basis.declare_cross_basis()` and the crossing appears in the artifact in
+  words.
+
+Uninitialised KV is allowed and recorded, but it makes the result UNDETERMINED:
+MoE routing depends on the hidden states, so garbage KV can route differently
+from a real workload and change the grouped-matmul time. **Direction of that
+bias: unknown.** Prefer `kv_prefilled=True`, i.e. one real prefill before the
+window opens.
+
+### The engine binding is a named seam
+
+This module owns the protocol, timing, statistics and verdict. The caller
+supplies `step()` and `sync()`. The intended in-tree binding is
+`TPUModelRunner.execute_model` driven from a decode-only scheduler output whose
+requests already have `num_computed_tokens` at the context length, with
+`jax.block_until_ready` as the sync -- named here rather than written into the
+module, because that call sequence has never been exercised by the author and a
+guessed binding that runs is worse than an explicit seam that does not.
