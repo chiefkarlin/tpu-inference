@@ -346,7 +346,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                           thresholds=thresholds)
     print(f"M2: {chk.outcome.value} -- {chk.reason}")
     print(f"    raw values: {json.dumps(estimate.raw_values)}")
-    return 0 if chk.outcome is common.Outcome.PASSED else 1
+    return common.exit_code(chk.outcome)
 
 
 if __name__ == "__main__":

@@ -786,7 +786,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # two different measurements and the exit status carries neither.
         print(f"  NEGATIVE CONTROL leg 1: {report.leg_1_control['response']} "
               f"-- {report.leg_1_control['why']}")
-    return 0 if report.outcome is common.Outcome.PASSED else 1
+    return common.exit_code(report.outcome)
 
 
 if __name__ == "__main__":

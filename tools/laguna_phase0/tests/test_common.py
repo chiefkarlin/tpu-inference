@@ -98,3 +98,66 @@ def test_an_empty_payload_is_refused_rather_than_written():
     with pytest.raises(common.IntermediatesMissingError):
         common.write_artifact("/tmp/laguna-phase0-should-not-exist.json",
                               kind="TEST", payload={})
+
+
+# --- THE EXIT CONTRACT ----------------------------------------------------
+#
+# These pin the mapping itself. The end-to-end consequence, through a real
+# main(), is in test_m0_warm_cache.py -- BOTH LEVELS ARE KEPT ON PURPOSE: a
+# unit test of exit_code would still pass if every module stopped calling it.
+
+
+def test_the_four_exit_codes_are_distinct():
+    """THE PROPERTY, NOT THE VALUES.
+
+    Asserting each constant equals a literal would not catch the defect being
+    fixed, because the defect was TWO NAMES SHARING ONE INTEGER and each name
+    read correctly on its own. Distinctness is the thing that was violated.
+    """
+    codes = [common.EXIT_DECIDED_CLEAN,
+             common.EXIT_DECIDED_NOT_CLEAN,
+             common.EXIT_COULD_NOT_RUN,
+             common.EXIT_RAN_BUT_COULD_NOT_DECIDE]
+    assert len(set(codes)) == len(codes) == 4
+
+
+def test_only_a_pass_is_zero():
+    """Every non-pass stays non-zero. This is what made the change landable.
+
+    A refinement of 1 into 1-and-3 cannot turn any red green. If a later edit
+    promotes UNDETERMINED to 0 on the argument that "nothing actually failed",
+    this fails.
+    """
+    assert common.exit_code(common.Outcome.PASSED) == 0
+    assert common.exit_code(common.Outcome.FAILED) != 0
+    assert common.exit_code(common.Outcome.UNDETERMINED) != 0
+
+
+def test_failed_and_undetermined_do_not_share_a_code():
+    """THE DEFECT, STATED AS THE ONE ASSERTION THAT WOULD HAVE CAUGHT IT."""
+    assert (common.exit_code(common.Outcome.FAILED)
+            != common.exit_code(common.Outcome.UNDETERMINED))
+
+
+def test_every_outcome_member_is_mapped():
+    """NO MEMBER MAY BE UNMAPPED, AND THE DENOMINATOR IS THE ENUM ITSELF.
+
+    Listing the three members by hand would keep passing if a fourth were
+    added, which is precisely when the mapping needs attention. Iterating the
+    enum makes the test grow with the type.
+    """
+    for outcome in common.Outcome:
+        assert isinstance(common.exit_code(outcome), int)
+
+
+def test_a_non_outcome_raises_rather_than_getting_a_default_code():
+    """There is deliberately no fall-through arm.
+
+    A default would silently re-create the bug: an unrecognised disposition
+    would quietly join an existing bucket, which is exactly how FAILED and
+    UNDETERMINED came to share 1.
+    """
+    with pytest.raises(TypeError):
+        common.exit_code("PASSED")
+    with pytest.raises(TypeError):
+        common.exit_code(None)

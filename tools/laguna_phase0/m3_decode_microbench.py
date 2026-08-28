@@ -308,7 +308,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"M3: artifact written to {args.out}")
     for item in checks:
         print(f"  {item.name}: {item.outcome.value} -- {item.reason}")
-    return 0 if common.worst(c.outcome for c in checks) is common.Outcome.PASSED else 1
+    return common.exit_code(common.worst(c.outcome for c in checks))
 
 
 if __name__ == "__main__":

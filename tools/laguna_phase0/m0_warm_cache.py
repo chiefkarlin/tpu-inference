@@ -592,7 +592,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"M0: window is {verdict.value}; artifact written to {args.out}")
     for item in checks:
         print(f"  {item.name}: {item.outcome.value} -- {item.reason}")
-    return 0 if verdict is WindowVerdict.VALID else 1
+    # TOTAL BY DICT LOOKUP, NOT BY else. A new WindowVerdict member raises
+    # KeyError here instead of silently inheriting some other member's code.
+    return {
+        WindowVerdict.VALID: common.EXIT_DECIDED_CLEAN,
+        WindowVerdict.VOID: common.EXIT_DECIDED_NOT_CLEAN,
+        WindowVerdict.UNDETERMINED: common.EXIT_RAN_BUT_COULD_NOT_DECIDE,
+    }[verdict]
 
 
 if __name__ == "__main__":

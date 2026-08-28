@@ -237,16 +237,62 @@ def test_a_void_window_exits_one_because_it_ran_and_did_not_pass():
                         "--out", str(root / "m0.json")]) == 1
 
 
-def test_an_undetermined_window_exits_one_and_not_two():
-    """UNDETERMINED is a verdict the instrument reached, so it is not a 2."""
+def test_an_undetermined_window_is_not_two_and_is_not_one_either():
+    """UNDETERMINED is a verdict the instrument reached, so it is not a 2.
+
+    THE OLD NAME OF THIS TEST WAS `..._exits_one_and_not_two`, AND THAT NAME IS
+    THE WHOLE DEFECT. The author asked "1 or 2?", answered it correctly, and
+    pinned the answer. Nobody asked the other question: a VOID window ALSO
+    exited 1, so the code that meant "I checked and it is bad" and the code
+    that meant "I COULD NOT CHECK" were the same integer. The second is the
+    worse fact and it was wearing the first one's clothes.
+
+    Both halves are asserted here so neither can rot: not 2 (the run happened),
+    and not 1 (a verdict was NOT reached).
+    """
     with tempfile.TemporaryDirectory() as tmp:
         root = pathlib.Path(tmp)
         evidence_path = root / "evidence.json"
         evidence_path.write_text(
             json.dumps(build_evidence(warmed=BUCKETS, start=None, end=None).to_dict()),
             encoding="utf-8")
-        assert m0.main(["evaluate", "--evidence", str(evidence_path),
-                        "--out", str(root / "m0.json")]) == 1
+        rc = m0.main(["evaluate", "--evidence", str(evidence_path),
+                      "--out", str(root / "m0.json")])
+        assert rc != common.EXIT_COULD_NOT_RUN
+        assert rc != common.EXIT_DECIDED_NOT_CLEAN
+        assert rc == common.EXIT_RAN_BUT_COULD_NOT_DECIDE
+
+
+def test_void_and_undetermined_do_not_share_an_exit_code():
+    """THE DEFECT ITSELF, PINNED AS ONE ASSERTION RATHER THAN TWO CONSTANTS.
+
+    Asserting each code separately would still pass if a later edit collapsed
+    them onto the same NEW value. This compares the two codes an operator
+    actually receives, from two real runs, so the property survives renaming.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        void_path = root / "void.json"
+        void_path.write_text(
+            json.dumps(build_evidence(warmed=BUCKETS, start=7, end=9).to_dict()),
+            encoding="utf-8")
+        undet_path = root / "undet.json"
+        undet_path.write_text(
+            json.dumps(build_evidence(warmed=BUCKETS, start=None, end=None).to_dict()),
+            encoding="utf-8")
+        void_rc = m0.main(["evaluate", "--evidence", str(void_path),
+                           "--out", str(root / "void-out.json")])
+        undet_rc = m0.main(["evaluate", "--evidence", str(undet_path),
+                            "--out", str(root / "undet-out.json")])
+        # POSITIVE CONTROL ON THE FIXTURES: if a mistake made both documents
+        # produce the SAME verdict, the inequality below would be measuring
+        # nothing. Pin what each one actually is before comparing them.
+        assert void_rc == common.EXIT_DECIDED_NOT_CLEAN
+        assert undet_rc == common.EXIT_RAN_BUT_COULD_NOT_DECIDE
+        assert void_rc != undet_rc
+        # AND NEITHER MAY BE GREEN. This is the property that made the change
+        # safe to land: a refinement of 1, never a promotion to 0.
+        assert void_rc != 0 and undet_rc != 0
 
 
 def test_a_missing_evidence_file_exits_two_and_not_one():
@@ -410,8 +456,14 @@ def test_a_document_with_no_plan_does_not_exit_zero():
         root = pathlib.Path(tmp)
         path = root / "evidence.json"
         path.write_text(json.dumps(_document(plan=_ABSENT)), encoding="utf-8")
-        assert m0.main(["evaluate", "--evidence", str(path),
-                        "--out", str(root / "m0.json")]) == 1
+        rc = m0.main(["evaluate", "--evidence", str(path),
+                      "--out", str(root / "m0.json")])
+        # THE NAMED CONTRACT FIRST, THE EXACT VALUE SECOND. This assertion used
+        # to read `== 1`, which was NARROWER THAN THE CONTRACT THE NAME STATES
+        # and pinned an answer the test was not written to be about. A missing
+        # plan is not-decidable, not decided-bad.
+        assert rc != 0
+        assert rc == common.EXIT_RAN_BUT_COULD_NOT_DECIDE
 
 
 def test_the_round_trip_a_real_harness_performs_is_unaffected():

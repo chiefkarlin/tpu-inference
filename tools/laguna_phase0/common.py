@@ -327,6 +327,59 @@ def worst(outcomes: Iterable[Outcome]) -> Outcome:
     return Outcome.PASSED
 
 
+# --- EXIT STATUS ----------------------------------------------------------
+#
+# THE DEFECT THIS REPLACES. Every module ended its main with
+#     return 0 if <outcome> is Outcome.PASSED else 1
+# which collapses a THREE-state Outcome onto a TWO-state exit. FAILED and
+# UNDETERMINED both left as 1, so a caller could not tell "I checked and it did
+# not pass" from "I COULD NOT CHECK". Those are not the same fact, and the
+# second is the worse one, because an UNDETERMINED that reads as a FAILED looks
+# like a result. Six modules had it in identical form; it is one shape, not six
+# bugs.
+#
+# WHAT WAS ALREADY RIGHT AND IS PRESERVED: m0's docstring argued that
+# UNDETERMINED must not be 2, because 2 means the run never happened. That
+# argument is correct. It was simply never the whole question -- the question
+# nobody asked was 1-VERSUS-1, and the test pinning the old behaviour is named
+# `..._exits_one_and_not_two`, which records exactly the question that WAS
+# asked.
+#
+# THE SAFETY PROPERTY THAT MAKES THIS LANDABLE: EVERY NON-PASS STAYS NON-ZERO.
+# No caller that tests truthiness, or writes `cmd || fail`, changes behaviour.
+# The only newly reachable value is 3, and 3 is strictly a REFINEMENT of what
+# used to be 1 -- it never turns a red into a green.
+
+EXIT_DECIDED_CLEAN = 0
+EXIT_DECIDED_NOT_CLEAN = 1
+EXIT_COULD_NOT_RUN = 2
+EXIT_RAN_BUT_COULD_NOT_DECIDE = 3
+
+
+def exit_code(outcome: Outcome) -> int:
+    """Maps the three-state disposition onto a four-state exit status.
+
+    THERE IS DELIBERATELY NO DEFAULT ARM. A fall-through default would
+    silently re-create the bug being fixed, because the failure mode IS "two
+    different facts arrived at the same integer". A new Outcome member must
+    make this raise, not quietly join an existing bucket.
+
+    EXIT_COULD_NOT_RUN is defined here but never returned here: it belongs to
+    the guard clauses that fire BEFORE anything is assessed, and no outcome
+    exists at that point to map.
+    """
+    if outcome is Outcome.PASSED:
+        return EXIT_DECIDED_CLEAN
+    if outcome is Outcome.FAILED:
+        return EXIT_DECIDED_NOT_CLEAN
+    if outcome is Outcome.UNDETERMINED:
+        return EXIT_RAN_BUT_COULD_NOT_DECIDE
+    raise TypeError(
+        f"exit_code received {outcome!r}, which is not an Outcome. Refusing to "
+        "pick a code: guessing here is how FAILED and UNDETERMINED came to "
+        "share one in the first place.")
+
+
 def utc_now_iso() -> str:
     return datetime.datetime.now(
         datetime.timezone.utc).replace(microsecond=0).isoformat()

@@ -1123,7 +1123,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # went non-zero on REFUTED would make "the rule refuted the hypothesis"
     # indistinguishable from "the rule could not be run", which is precisely the
     # collapse this module's two-axis design exists to prevent.
-    return 0 if overall is common.Outcome.PASSED else 1
+    return common.exit_code(overall)
 
 
 if __name__ == "__main__":
