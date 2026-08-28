@@ -120,8 +120,19 @@ def test_the_non_overlap_term_is_dma_in_flight_with_no_compute():
 # defects IN the emitter and a hand-built profile cannot exhibit them.
 
 
+# A caller that DID confirm how its timestamps become seconds. Round 3 F-J made
+# that declaration load-bearing: the emitter no longer asserts confirmed units
+# on its own authority, it propagates the caller's. A clean run is one where the
+# caller confirmed the conversion, so the default factory below declares one --
+# and `units=None` is left reachable and is exercised by its own tests.
+CONFIRMED_UNITS = m1.TraceUnits(
+    seconds_per_tick=1.0,
+    source="test fixture: intervals are authored directly in seconds",
+    confirmed=True)
+
+
 def emitted_step(*, mapped=None, unmapped=(), window=(0.0, 1.0), kinds=None,
-                 index=0, run_id="run-a"):
+                 index=0, run_id="run-a", units=CONFIRMED_UNITS):
     """One emitter-produced profile. The only profile factory this section uses."""
     mapped = {"grouped_matmul": [m1.Interval(0.0, 0.4)]} if mapped is None else mapped
     kinds = ({k: m1.BucketKind.COMPUTE for k in mapped} if kinds is None else kinds)
@@ -129,7 +140,8 @@ def emitted_step(*, mapped=None, unmapped=(), window=(0.0, 1.0), kinds=None,
         step=index, run_id=run_id, window=m1.Interval(*window),
         intervals_by_bucket=mapped,
         mapping=m1.EventMapping({}, kinds),
-        unmapped=[(n, m1.Interval(*iv)) for n, iv in unmapped])
+        unmapped=[(n, m1.Interval(*iv)) for n, iv in unmapped],
+        units=units)
 
 
 def test_unmapped_device_busy_time_is_not_booked_as_host_idle():
@@ -752,3 +764,112 @@ def test_the_never_read_assertion_is_run_against_a_recording_provenance():
     # 3. The key under test IS spellable and IS present in the file, so the
     #    absence above is a fact about reading and not a typo.
     assert ts.entry("m1.reference_step_ms").key == "m1.reference_step_ms"
+
+
+# --------------------------------------------------------------------------
+# ROUND 3 F-J. `m1.counter_units` read a flag the emitter set about itself.
+#
+# 0015 renamed this check because the OLD NAME falsely reassured a skimmer, and
+# left the mechanism untouched one line below. The rename was right and it was
+# presentation. These tests are the substance: THE CONFIRMATION MUST COME FROM
+# THE CALLER'S DECLARATION, AND AN UNCONFIRMED CONVERSION MUST PROPAGATE.
+#
+# Measured before the fix, and this is why it mattered: `TraceUnits.confirmed`
+# had ZERO reads in the package and `TraceUnits` had ZERO construction sites,
+# tests included -- while its own docstring promised "an unconfirmed conversion
+# propagates into every counter this module derives, and the emitted provenance
+# says so". A CONTRACT STATED IN PROSE AND IMPLEMENTED BY NOTHING.
+# --------------------------------------------------------------------------
+
+UNCONFIRMED_UNITS = m1.TraceUnits(
+    seconds_per_tick=1e-9,
+    source="a device clock whose tick rate nobody has documented",
+    confirmed=False)
+
+
+def _derived_quantities(profile):
+    """Every counter this module DERIVES. hbm_bytes is excluded on purpose: it
+    is supplied by the caller, not derived here, and carries its own
+    provenance."""
+    return ([profile.step_time, profile.idle_strict, profile.idle_loose,
+             profile.bucket_overlap] + list(profile.buckets.values()))
+
+
+def test_an_unconfirmed_conversion_propagates_into_every_derived_counter():
+    """The sentence TraceUnits' docstring has always made, now enforced.
+
+    NOT 'at least one counter' -- EVERY one. A single derived counter left
+    stamped confirmed would let `m1.counter_units` report a clean subset while
+    the quantity a reader actually compares is the unconfirmed one.
+    """
+    profile = emitted_step(units=UNCONFIRMED_UNITS)
+    quantities = _derived_quantities(profile)
+    assert quantities, "fixture produced no derived counters; the test is vacuous"
+    unconfirmed = [q.provenance.name for q in quantities
+                   if not q.provenance.units_confirmed]
+    assert len(unconfirmed) == len(quantities), (
+        f"{len(quantities) - len(unconfirmed)} derived counters still claim "
+        f"confirmed units under an unconfirmed conversion")
+
+
+def test_declaring_no_units_at_all_does_not_buy_a_confirmed_unit():
+    """OMISSION IS NOT CONFIRMATION, AND IT USED TO BE.
+
+    `units` is optional so that omitting it is DETECTABLE. Before this change
+    the emitter hardcoded units_confirmed=True and no caller could say
+    otherwise, so the silent default was the most reassuring value available.
+    """
+    profile = emitted_step(units=None)
+    assert all(not q.provenance.units_confirmed
+               for q in _derived_quantities(profile))
+    assert m1.check_counter_units([profile]).outcome is not common.Outcome.PASSED
+
+
+def test_a_confirmed_conversion_still_reaches_passed():
+    """POSITIVE CONTROL, AND IT IS LOAD-BEARING.
+
+    The three tests above are satisfied by a check that can never pass, which
+    is the C1/C6/P1 defect this campaign exists to catch -- and the blunt
+    version of this fix (flip the five constants to False) DID produce it and
+    was caught by the package's own anti-pinning guard. PASSED must stay
+    reachable through the emitter, from a caller that confirmed its units.
+    """
+    profile = emitted_step(units=CONFIRMED_UNITS)
+    assert all(q.provenance.units_confirmed
+               for q in _derived_quantities(profile))
+    assert m1.check_counter_units([profile]).outcome is common.Outcome.PASSED
+
+
+def test_trace_units_confirmed_is_read_and_is_not_decoration():
+    """Flipping ONLY `confirmed` must change the emitted record.
+
+    Its docstring opens "``confirmed`` is not decoration." That was false when
+    written: the field had zero reads. This test fails if anyone makes it true
+    again, and it varies exactly one input so a pass cannot come from anywhere
+    else.
+    """
+    confirmed = m1.TraceUnits(seconds_per_tick=1e-9, source="same source",
+                              confirmed=True)
+    unconfirmed = m1.TraceUnits(seconds_per_tick=1e-9, source="same source",
+                                confirmed=False)
+    assert (emitted_step(units=confirmed).step_time.provenance.units_confirmed
+            is not
+            emitted_step(units=unconfirmed).step_time.provenance.units_confirmed)
+
+
+def test_an_undeclared_conversion_is_distinguishable_from_a_declared_bad_one():
+    """Two different facts must not arrive as the same record.
+
+    'The caller never told us' and 'the caller told us it could not confirm'
+    both yield units_confirmed=False, and a reader who has to act on them needs
+    to tell them apart -- the first is a hole in the harness, the second is a
+    hole in the profiler. Collapsing them is the same class of defect as VOID
+    and UNDETERMINED sharing exit 1.
+    """
+    silent = emitted_step(units=None).step_time.provenance.source
+    declared = emitted_step(units=UNCONFIRMED_UNITS).step_time.provenance.source
+    assert silent != declared
+    assert UNCONFIRMED_UNITS.source in declared, (
+        "the declared-but-unconfirmed record must name the conversion the "
+        "caller could not confirm, or a reader cannot chase it")
+    assert UNCONFIRMED_UNITS.source not in silent

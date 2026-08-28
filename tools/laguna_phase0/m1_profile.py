@@ -300,6 +300,48 @@ def step_from_dict(payload: Mapping[str, Any]) -> DecodeStepProfile:
         unmapped_event_names=tuple(payload.get("unmapped_event_names", ())))
 
 
+def _timed(provenance: common.CounterProvenance,
+           units: Optional[TraceUnits]) -> common.CounterProvenance:
+    """Stamps a derived seconds counter with the confirmation it actually has.
+
+    ROUND 3 F-J. EVERY COUNTER BELOW IS DERIVED FROM INTERVALS THE CALLER HAD
+    ALREADY CONVERTED TO SECONDS, so this module's confidence that they are
+    seconds IS EXACTLY THE CALLER'S CONFIDENCE IN THAT CONVERSION AND NOTHING
+    MORE. It has no independent evidence and cannot acquire any.
+
+    Before this change the five derived provenances carried a hardcoded
+    ``units_confirmed=True`` one line under a ``source`` string that said, in
+    the same breath, "converted to seconds by the CALLER-DECLARED TraceUnits".
+    THE SELF-DECLARATION AND THE THING IT WAS DECLARING ABOUT SAT ONE LINE
+    APART. `check_counter_units` then read that flag back and reported "every
+    emitted counter carries confirmed units" -- an assertion sourced entirely
+    from the assertion it was auditing.
+
+    `TraceUnits` already documented the correct contract at its own docstring:
+    "An unconfirmed conversion propagates into every counter this module
+    derives, and the emitted provenance says so." IT PROPAGATED NOWHERE.
+    Measured before this change: `TraceUnits.confirmed` had ZERO reads in the
+    package and `TraceUnits` had ZERO construction sites, tests included. The
+    contract was stated in prose and implemented by nothing. THIS FUNCTION IS
+    THAT SENTENCE, IN CODE.
+
+    ``units=None`` means THE CALLER DECLARED NOTHING, which is not confirmation
+    and is not recorded as any. It is the unconfirmed case.
+    """
+    if units is not None and units.confirmed:
+        return provenance
+    if units is None:
+        why = ("; NO TraceUnits WAS DECLARED TO THIS MODULE, so the conversion "
+               "to seconds is undemonstrated and the unit reads UNKNOWN")
+    else:
+        why = ("; the caller declared a TraceUnits it could NOT confirm ("
+               + units.source + "), and an unconfirmed conversion propagates "
+               "into every counter derived from it")
+    return dataclasses.replace(provenance,
+                               units_confirmed=False,
+                               source=provenance.source + why)
+
+
 def step_profile_from_intervals(
     *,
     step: int,
@@ -309,6 +351,7 @@ def step_profile_from_intervals(
     mapping: EventMapping,
     hbm_bytes: Optional[Quantity] = None,
     unmapped: Sequence[Tuple[str, Interval]] = (),
+    units: Optional[TraceUnits] = None,
 ) -> DecodeStepProfile:
     """Turns one step's intervals into the emitted profile.
 
@@ -316,6 +359,11 @@ def step_profile_from_intervals(
     the boundary contributes only the part inside, or the terms would sum past
     the step and the closure residual would go negative for a reason that has
     nothing to do with double counting.
+
+    ``units`` is the caller's declaration of how its timestamps became seconds.
+    It is optional ONLY so that omitting it is possible to detect: omitting it
+    does not buy a confirmed unit, it publishes an unconfirmed one. See
+    ``_timed``.
     """
     clipped: Dict[str, List[Interval]] = {}
     for bucket, intervals in intervals_by_bucket.items():
@@ -325,7 +373,9 @@ def step_profile_from_intervals(
 
     per_bucket = {
         bucket: Quantity(union_duration(intervals),
-                         dataclasses.replace(COUNTER_BUCKET, name=f"bucket.{bucket}"))
+                         _timed(dataclasses.replace(COUNTER_BUCKET,
+                                                    name=f"bucket.{bucket}"),
+                                units))
         for bucket, intervals in clipped.items()
     }
 
@@ -381,11 +431,12 @@ def step_profile_from_intervals(
     return DecodeStepProfile(
         step=step,
         run_id=run_id,
-        step_time=Quantity(step_seconds, COUNTER_STEP_TIME),
-        idle_strict=Quantity(idle_strict, COUNTER_IDLE_STRICT),
-        idle_loose=Quantity(idle_loose, COUNTER_IDLE_LOOSE),
+        step_time=Quantity(step_seconds, _timed(COUNTER_STEP_TIME, units)),
+        idle_strict=Quantity(idle_strict, _timed(COUNTER_IDLE_STRICT, units)),
+        idle_loose=Quantity(idle_loose, _timed(COUNTER_IDLE_LOOSE, units)),
         buckets=per_bucket,
-        bucket_overlap=Quantity(overlap, COUNTER_BUCKET_OVERLAP),
+        bucket_overlap=Quantity(overlap,
+                                _timed(COUNTER_BUCKET_OVERLAP, units)),
         hbm_bytes=hbm_bytes,
         unmapped_event_seconds=total_duration([c for _, c in unmapped_clipped]),
         unmapped_event_names=tuple(sorted({n for n, _ in unmapped_clipped})))
