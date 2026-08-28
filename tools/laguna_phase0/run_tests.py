@@ -52,8 +52,17 @@ This list is here, and not only in the fix document, because a reader who runs
 this file must be able to find its limits without knowing that any other
 document exists.
 
-Unsupported, and a test using any of these will ERROR or be silently skipped
-rather than quietly "pass":
+Unsupported. **THE SENTENCE HERE USED TO PROMISE THAT A TEST USING ANY OF THESE
+WOULD "ERROR OR BE SILENTLY SKIPPED RATHER THAN QUIETLY PASS", AND THAT PROMISE
+WAS MEASURED FALSE FOR ONE CONSTRUCT** by a non-author sweep: an ``async def``
+test containing ``assert False`` was collected, never awaited, and REPORTED AS
+PASSED. Calling a coroutine function raises nothing. The promise is now kept by
+``unsupported_constructs``, which refuses the whole run with exit 6 rather than
+by hoping; for everything else the promise remains **an argument about how
+collection works, not a measurement**, and each item is marked accordingly:
+
+* **``async def`` tests -- MEASURED, and now REFUSED with exit 6.** No async
+  test exists in this suite, so no published count was affected
 
 * fixtures of every kind, including ``@pytest.fixture``, and therefore all of
   the builtin fixtures -- ``tmp_path``, ``tmp_path_factory``, ``monkeypatch``,
@@ -72,6 +81,11 @@ rather than quietly "pass":
 * ``pytest.approx`` on anything but a SCALAR (rel=1e-6, abs=1e-12); no
   sequences, dicts or numpy arrays
 * ``pytest.raises`` other than as a CONTEXT MANAGER, and it takes no ``match=``
+* **files in SUBDIRECTORIES of ``tests/``.** ``collect`` globs one level.
+  Previously such a file was neither collected nor mentioned; it is now
+  reconciled against a RECURSIVE listing and refuses the run with exit 5. The
+  runner did not gain the ability to run a nested file -- it lost the ability
+  to ignore one
 
 SO THE HONEST CLAIM A COUNT FROM THIS RUNNER SUPPORTS is: "these N module-level
 test functions were collected and executed by the fallback runner, and none
@@ -83,16 +97,22 @@ use ``--list``. An honest untested beats an unreproducible 37-of-37.
 
 That reconciliation was run on this tree rather than assumed, and it is stated
 as a MEASUREMENT ON A DATE and not as a standing property of the suite: as of
-this commit, ``def test_`` appears 156 times across the 8 test files, 156 are
-collected, and no test uses any construct in the unsupported list above -- the
-only occurrences of the word "fixture" in the suite are in string literals and
-comments. There are **no indented test functions**, and **one** class
-definition in the suite, ``approx`` in ``tests/test_m1_profile.py``, which is a
-local comparator and not a ``class Test*``; it is therefore correctly not
-collected. That is stated rather than reported as "no classes", because "no
-classes" would have been a true-sounding summary of a tree that has one.
+this commit, ``def test_`` appears **160** times at module level across the 8
+test files, **160** are collected, and no test uses any construct in the
+unsupported list above -- the only occurrences of the word "fixture" in the
+suite are in string literals and comments. There are **two indented ``def
+test_`` lines**, both in ``tests/test_run_tests.py`` and both deliberate: an
+``async def`` defined inside a test so the refusal can be exercised without
+disabling the suite, and a one-line file written to disk by the
+subdirectory test. Neither is collected, and the reconciliation counts
+module-level definitions only, so **the totals agree because the indented two
+are excluded on purpose and not because nothing indented exists**. There is
+**one** class definition in the suite, ``approx`` in
+``tests/test_m1_profile.py``, a local comparator and not a ``class Test*``;
+correctly not collected. Stated that way rather than as "no classes", because
+"no classes" would have been a true-sounding summary of a tree that has one.
 
-So for THIS suite, at THIS commit, the gap between "156 collected and executed"
+So for THIS suite, at THIS commit, the gap between "160 collected and executed"
 and "the suite passes" is closed by inspection. **THE GAP REOPENS THE
 MOMENT SOMEONE ADDS A TEST USING A CONSTRUCT ABOVE, AND IT WILL REOPEN
 SILENTLY.** Re-run the reconciliation; do not inherit this paragraph's result.
@@ -113,7 +133,7 @@ prevents is ACCIDENTAL shadowing of a stronger tool by a weaker imitation.
 Deliberate shadowing is a supported mode; it takes an explicit flag, and every
 line this runner prints still says NOT pytest.
 
-EXIT STATUS -- SIX STATES, EACH DISTINGUISHABLE, WHICH IS THE POINT
+EXIT STATUS -- SEVEN STATES, EACH DISTINGUISHABLE, WHICH IS THE POINT
 
     0  every collected test passed, and at least one ran
     1  a collected test failed or errored -- it RAN and did not pass
@@ -126,6 +146,9 @@ EXIT STATUS -- SIX STATES, EACH DISTINGUISHABLE, WHICH IS THE POINT
     5  COLLECTION IS INCOMPLETE: a ``test_*.py`` on disk contributed no test.
        No count is printed at all, because the count would be true of a
        corpus nobody asked about
+    6  A COLLECTED TEST USES A CONSTRUCT THIS RUNNER CANNOT EXECUTE. Also no
+       count: the construct would otherwise be counted as passed WITHOUT
+       RUNNING, which is the failure mode this whole block exists to prevent
 
 **WHY 5 EXISTS AND WHY IT IS NOT A TEST.** A mutant that made ``collect`` read
 only the first test file SURVIVED THE ENTIRE SUITE, including the test written
@@ -134,6 +157,15 @@ collector never reaches. The suite printed a smaller green number and no
 failure. **A completeness check that the instrument can silently exclude is not
 a check**, so the reconciliation runs inside ``run`` on every full run, before
 any count is emitted. See ``uncollected_files``.
+
+**THE NAME FOR IT IS A SELF-REFERENTIAL BLIND SPOT**, and it is the newest
+member of the family of instruments that cannot come out differently. The
+family's older members could not DISTINGUISH two states of the world; this one
+could, and the fault GATED ITS OWN DETECTOR. Hence the two-clause question this
+package is now written against:
+
+    1. What input would make this say something else?
+    2. CAN THE THING UNDER TEST STOP THAT INPUT FROM EVER REACHING THE CHECK?
 
 **WHY 3 AND 4 ARE NOT 2 AND NOT 0.** An undeclared-changes sweep by a
 non-author found that the refusal used to return 2 -- the same code as "nothing
@@ -151,6 +183,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import importlib.util
+import inspect
 import math
 import pathlib
 import sys
@@ -173,6 +206,9 @@ EXIT_LISTED_ONLY = 4
 # looked at part of the corpus, so it has no result for that part and refuses
 # to publish a count that would be read as covering it.
 EXIT_COLLECTION_INCOMPLETE = 5
+# 6 is not "failed" either. The test was never executed, so there is no
+# result for it, and the runner will not publish a count that omits it.
+EXIT_UNSUPPORTED_CONSTRUCT = 6
 
 TESTS_DIR = pathlib.Path(__file__).with_name("tests")
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -323,6 +359,42 @@ def collect(select: Optional[str] = None) -> List[Tuple[str, str, Callable[[], A
     return found
 
 
+def test_files_on_disk() -> List[str]:
+    """Every ``test_*.py`` under ``TESTS_DIR``, RECURSIVELY, relative posix.
+
+    ``rglob``, not ``glob``. ``collect`` uses the non-recursive form, so a file
+    at ``tests/sub/test_x.py`` is not collected -- and before this, it was not
+    collected AND NOT MENTIONED. Reconciling against the recursive set turns a
+    silent omission into a refusal: the runner does not gain the ability to run
+    a nested file, it loses the ability to ignore one.
+    """
+    return sorted(p.relative_to(TESTS_DIR).as_posix()
+                  for p in TESTS_DIR.rglob("test_*.py"))
+
+
+def unsupported_constructs(
+        cases: Sequence[Tuple[str, str, Callable[[], Any]]]) -> List[str]:
+    """Collected tests this runner CANNOT execute, named one by one.
+
+    Today that is exactly one construct: ``async def``. Calling a coroutine
+    function returns a coroutine and raises nothing, so an ``async def`` test
+    containing ``assert False`` was COLLECTED, NEVER AWAITED, AND COUNTED AS
+    PASSED. Measured by a non-author sweep: 141 passed, 0 failed, exit 0, with
+    a deliberately failing async test in the corpus.
+
+    The module docstring promised unsupported constructs would error or be
+    visibly skipped. IT DID NOT PROMISE THEM AWAY, AND THE PROMISE WAS NOT
+    KEPT. There are no async tests in this suite today, so no published count
+    is affected; this closes a latent hole in a guarantee, not a live false
+    green, and it is NOT counted as a silent behavioural change because the
+    change is declared here.
+    """
+    return [f"{module_name}::{test_name} is an 'async def'; this runner never "
+            "awaits it, so it would be counted as passed without running"
+            for module_name, test_name, fn in cases
+            if inspect.iscoroutinefunction(fn)]
+
+
 def uncollected_files(
         cases: Sequence[Tuple[str, str, Callable[[], Any]]]) -> List[str]:
     """Test files on disk that contributed no collected test.
@@ -350,9 +422,8 @@ def uncollected_files(
       never returns the code for a pass, so it cannot manufacture a green
       result, but it CAN under-report a count to a reader who trusts it.
     """
-    seen = {module_name for module_name, _, _ in cases}
-    return sorted(p.stem for p in TESTS_DIR.glob("test_*.py")
-                  if p.stem not in seen)
+    seen = {f"{module_name}.py" for module_name, _, _ in cases}
+    return [rel for rel in test_files_on_disk() if rel not in seen]
 
 
 def run(select: Optional[str] = None, verbose: bool = False) -> int:
@@ -367,6 +438,14 @@ def run(select: Optional[str] = None, verbose: bool = False) -> int:
                   "corpus is worse than no result, because it looks like the "
                   "whole corpus.")
             return EXIT_COLLECTION_INCOMPLETE
+    refused = unsupported_constructs(cases)
+    if refused:
+        print(f"{BANNER}\nlaguna-phase0 fallback runner: UNSUPPORTED "
+              f"CONSTRUCT. {len(refused)} collected test(s) cannot be executed "
+              "by this runner:\n  " + "\n  ".join(refused)
+              + "\nNO COUNT IS REPORTED. Running the rest and reporting a "
+                "number would report a pass for tests that never ran.")
+        return EXIT_UNSUPPORTED_CONSTRUCT
     if not cases:
         print(f"{BANNER}\ncollected 0 tests"
               + (f" matching {select!r}" if select else "")
@@ -397,7 +476,7 @@ def run(select: Optional[str] = None, verbose: bool = False) -> int:
     passed = len(cases) - len(failures)
     print(f"\nlaguna-phase0 fallback runner (NOT pytest): "
           f"{passed} passed, {len(failures)} failed, {len(cases)} collected "
-          f"from {len(sorted(TESTS_DIR.glob('test_*.py')))} files")
+          f"from {len(test_files_on_disk())} files")
     return EXIT_SOMETHING_FAILED if failures else EXIT_ALL_PASSED
 
 

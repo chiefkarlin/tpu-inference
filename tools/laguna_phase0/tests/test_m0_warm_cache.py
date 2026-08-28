@@ -13,8 +13,17 @@
 # limitations under the License.
 """Unit tests for the M0 warm-cache protocol.
 
-NOT EXECUTED. Written without run authorisation; the presence of this file is
-not evidence that anything in it passes.
+**THE "NOT EXECUTED" NOTICE THAT USED TO BE HERE WAS STALE AND IS REMOVED.**
+It was written before this package had a runner and it survived several
+commits in which these tests were in fact collected and executed. A stale
+disclaimer is not a safe default: it invites a reader either to discount a real
+result or to conclude the file's own notes cannot be trusted.
+
+What is true as of `run_tests.py` landing: these tests are collected and
+executed by `tools/laguna_phase0/run_tests.py`, WHICH IS NOT PYTEST and
+supports far less. A count from it means "collected and executed by the
+fallback runner, and none raised" -- it does not mean "the suite passes", and
+NOTHING IN THIS FILE HAS EVER BEEN RUN AGAINST HARDWARE.
 """
 
 import json

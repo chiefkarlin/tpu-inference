@@ -54,7 +54,7 @@ SELF = "test_run_tests"
 MATCHES_NOTHING = "zzz_no_test_has_this_in_its_name"
 
 
-def test_the_six_exit_codes_are_distinct():
+def test_the_seven_exit_codes_are_distinct():
     """The whole point of the change. If two collapse, the fix is undone."""
     codes = [
         run_tests.EXIT_ALL_PASSED,
@@ -63,6 +63,7 @@ def test_the_six_exit_codes_are_distinct():
         run_tests.EXIT_DECLINED,
         run_tests.EXIT_LISTED_ONLY,
         run_tests.EXIT_COLLECTION_INCOMPLETE,
+        run_tests.EXIT_UNSUPPORTED_CONSTRUCT,
     ]
     assert len(set(codes)) == len(codes)
     assert run_tests.EXIT_ALL_PASSED == 0
@@ -156,15 +157,16 @@ def test_uncollected_files_names_the_files_that_contributed_nothing():
     an empty list for empty input would be the same defect one level up -- it
     would call the total truncation clean.
     """
-    on_disk = sorted(p.stem for p in run_tests.TESTS_DIR.glob("test_*.py"))
+    on_disk = run_tests.test_files_on_disk()
     assert run_tests.uncollected_files([]) == on_disk
     assert on_disk, "no test files on disk at all -- UNDETERMINED, not a pass"
 
-    truncated = [(on_disk[0], "test_x", lambda: None)]
+    stems = [name[: -len(".py")] for name in on_disk]
+    truncated = [(stems[0], "test_x", lambda: None)]
     assert run_tests.uncollected_files(truncated) == on_disk[1:]
     assert on_disk[0] not in run_tests.uncollected_files(truncated)
 
-    full = [(stem, "test_x", lambda: None) for stem in on_disk]
+    full = [(stem, "test_x", lambda: None) for stem in stems]
     assert run_tests.uncollected_files(full) == []
 
 
@@ -194,6 +196,75 @@ def test_a_truncated_collector_gets_its_own_code_and_prints_no_count():
     assert rc != run_tests.EXIT_SOMETHING_FAILED
     assert "COLLECTION IS INCOMPLETE" in out
     assert "passed," not in out, "a count was printed over a truncated corpus"
+
+
+def test_an_async_test_is_refused_and_never_counted_as_passed():
+    """Sweep measured this one as a live false pass: collected, never awaited.
+
+    The async function is defined INSIDE this test on purpose. At module level
+    the collector would find it, the runner would refuse every run, and the
+    suite could never report anything again -- which is the correct behaviour
+    for a real async test and useless for a test about that behaviour.
+    """
+    async def test_would_fail_if_it_ever_ran():
+        assert False, "if you see this, the runner awaited it"
+
+    named = run_tests.unsupported_constructs(
+        [("test_synthetic", "test_would_fail_if_it_ever_ran",
+          test_would_fail_if_it_ever_ran)])
+    assert len(named) == 1
+    assert "async def" in named[0]
+    assert not run_tests.unsupported_constructs(
+        [("test_synthetic", "test_ordinary", lambda: None)])
+
+    original = run_tests.collect
+
+    def with_one_async(select=None):
+        return list(original(select)) + [
+            ("test_synthetic", "test_would_fail_if_it_ever_ran",
+             test_would_fail_if_it_ever_ran)]
+
+    try:
+        run_tests.collect = with_one_async
+        rc, out = quietly([])
+    finally:
+        run_tests.collect = original
+
+    assert rc == run_tests.EXIT_UNSUPPORTED_CONSTRUCT
+    assert rc != run_tests.EXIT_ALL_PASSED
+    assert "UNSUPPORTED CONSTRUCT" in out
+    assert "passed," not in out, "a count was printed alongside a never-run test"
+
+
+def test_a_test_file_in_a_subdirectory_is_not_silently_ignored():
+    """The collector's glob is one level deep. Silence about that was the bug.
+
+    Writes a real file, because the reconciliation reads the disk and a mock of
+    the disk would be testing the mock. ABSOLUTE PATH, built from
+    ``TESTS_DIR``, never a relative write after a directory change.
+    """
+    nested_dir = run_tests.TESTS_DIR / "sub_probe"
+    nested = nested_dir / "test_nested_probe.py"
+    try:
+        nested_dir.mkdir(exist_ok=True)
+        nested.write_text("def test_nested():\n    assert True\n")
+
+        assert "sub_probe/test_nested_probe.py" in run_tests.test_files_on_disk()
+        collected = run_tests.collect()
+        assert all(module != "test_nested_probe" for module, _, _ in collected)
+        assert "sub_probe/test_nested_probe.py" in run_tests.uncollected_files(
+            collected)
+
+        rc, out = quietly([])
+        assert rc == run_tests.EXIT_COLLECTION_INCOMPLETE
+        assert "sub_probe/test_nested_probe.py" in out
+    finally:
+        if nested.exists():
+            nested.unlink()
+        if nested_dir.exists():
+            nested_dir.rmdir()
+    assert not nested_dir.exists(), "the probe directory outlived its test"
+    assert run_tests.uncollected_files(run_tests.collect()) == []
 
 
 def test_this_module_is_importable_under_the_name_the_collector_uses():

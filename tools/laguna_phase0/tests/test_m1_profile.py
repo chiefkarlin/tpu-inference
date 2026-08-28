@@ -186,19 +186,31 @@ def test_the_closure_residual_is_not_non_positive_by_construction():
     one profile, it is an assertion that the TERM CAN FIRE AT ALL. A quieter
     version of a check that cannot fire would still pass every single-profile
     test above.
+
+    THE THRESHOLD IS 2000 OF 2000, NOT ONE. An earlier revision asserted
+    ``positives > 0`` while the commit message claimed all 2000 fired. The
+    assertion was therefore weaker than the claim made for it, and a
+    regression that killed 1999 of the 2000 would have passed it silently. The
+    construction guarantees a positive residual on every draw -- ``cuts`` is
+    sorted, so the unmapped span is non-negative and is disjoint from the
+    mapped one -- so anything less than 2000 is a real change and not noise.
+    Measured min residual over this seed: 3.59e-05, seven orders of magnitude
+    above the 1e-12 floor, so the count is not sitting on the threshold.
     """
     rng = random.Random(20260828)
+    draws = 2000
     positives = 0
-    for _ in range(2000):
+    for _ in range(draws):
         cuts = sorted(rng.uniform(0.0, 1.0) for _ in range(4))
         mapped = {"grouped_matmul": [m1.Interval(cuts[0], cuts[1])]}
         unmapped = [("mystery", (cuts[2], cuts[3]))]
         derived = m1.derive(emitted_step(mapped=mapped, unmapped=unmapped))
         if derived.unattributed_s > 1e-12:
             positives += 1
-    assert positives > 0, (
-        "no emitter-produced profile in 2000 yielded a positive residual; the "
-        "closure term is non-positive by construction and is not a check")
+    assert positives == draws, (
+        f"only {positives} of {draws} emitter-produced profiles yielded a "
+        "positive residual; every draw is constructed to yield one, so the "
+        "closure term has become unable to fire on some inputs")
 
 
 def test_a_double_count_still_drives_the_residual_negative_from_the_emitter():
