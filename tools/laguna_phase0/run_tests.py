@@ -133,9 +133,10 @@ prevents is ACCIDENTAL shadowing of a stronger tool by a weaker imitation.
 Deliberate shadowing is a supported mode; it takes an explicit flag, and every
 line this runner prints still says NOT pytest.
 
-EXIT STATUS -- SEVEN STATES, EACH DISTINGUISHABLE, WHICH IS THE POINT
+EXIT STATUS -- EIGHT STATES, EACH DISTINGUISHABLE, WHICH IS THE POINT
 
-    0  every collected test passed, and at least one ran
+    0  every collected test passed, at least one ran, AND THE RUN COVERED THE
+       WHOLE TREE. Never returned under ``--select``; see 7
     1  a collected test failed or errored -- it RAN and did not pass
     2  NOTHING WAS COLLECTED. An empty run is UNDETERMINED and never a pass,
        the same rule the instruments follow, and the rule R7 exists because M0
@@ -149,14 +150,19 @@ EXIT STATUS -- SEVEN STATES, EACH DISTINGUISHABLE, WHICH IS THE POINT
     6  A COLLECTED TEST USES A CONSTRUCT THIS RUNNER CANNOT EXECUTE. Also no
        count: the construct would otherwise be counted as passed WITHOUT
        RUNNING, which is the failure mode this whole block exists to prevent
+    7  A PARTIAL RUN PASSED. Every test the selector matched passed, and the
+       run covered only part of the corpus BY REQUEST. Nothing is wrong; the
+       run simply has NO RESULT for the files it never touched, and a caller
+       must not read one
 
 **WHY 5 EXISTS AND WHY IT IS NOT A TEST.** A mutant that made ``collect`` read
 only the first test file SURVIVED THE ENTIRE SUITE, including the test written
 to catch exactly that, because that test lives in a file the truncated
 collector never reaches. The suite printed a smaller green number and no
 failure. **A completeness check that the instrument can silently exclude is not
-a check**, so the reconciliation runs inside ``run`` on every full run, before
-any count is emitted. See ``uncollected_files``.
+a check**, so the reconciliation runs inside ``run`` on every run, before any
+count is emitted -- whole-tree on a full run, and scoped to the selector on a
+``--select`` run. See ``uncollected_files`` and ``files_in_scope``.
 
 **THE NAME FOR IT IS A SELF-REFERENTIAL BLIND SPOT**, and it is the newest
 member of the family of instruments that cannot come out differently. The
@@ -166,6 +172,41 @@ package is now written against:
 
     1. What input would make this say something else?
     2. CAN THE THING UNDER TEST STOP THAT INPUT FROM EVER REACHING THE CHECK?
+
+**WHY 7 IS NOT 0, AND WHY THE DENOMINATOR MOVED.** ``--select`` used to be
+the worst path in this file, and it was worst precisely where the rest of the
+runner is strongest. A run of one module reconciled nothing (the completeness
+check was gated off by ``if select is None``), printed ``collected from 8
+files`` -- a RECURSIVE WALK OF THE WHOLE TREE -- as its denominator, and
+returned 0. So the narrowest run this runner offers emitted the widest claim it
+can make, and it did so in the shape every caller tests for: ``rc == 0``. The
+whole-tree file count made it WORSE than a naive runner rather than better,
+because the number was real, current, and about a corpus nobody had asked
+about.
+
+Three things changed and they are separable:
+
+* **The denominator of a partial run is now derived from the cases actually
+  collected** (``covered_files``), never from ``test_files_on_disk``. A run
+  reports the size of what it covered.
+* **A partial pass returns 7, not 0.** Only a whole-tree run may return the
+  code that means the suite passed.
+* **The reconciliation is no longer gated off; it is SCOPED** (``files_in_scope``).
+  Under ``--select`` it reconciles the collected set against every test file on
+  disk WHOSE STEM MATCHES THE SELECTOR, so a partial run still has a
+  completeness check that can fail instead of no check at all. Where the
+  selector names test functions rather than files, no file is in scope, the
+  scoped reconciliation has nothing to check, AND IT CLAIMS NOTHING -- that
+  limit is stated here rather than left to be discovered, because a check with
+  an empty input is UNDETERMINED and never a pass.
+
+``unsupported_constructs`` was left UNCONDITIONAL on purpose. It is already
+scoped by its argument -- it is handed ``cases``, which is the selected set --
+so it needs no gate, and gating it would reinstate the exact false pass it
+exists to prevent, one corpus narrower: an ``async def`` inside the selection
+would be collected, never awaited, and counted as passed. ``uncollected_files``
+is the opposite shape -- it reconciles against the DISK rather than against its
+argument -- which is why that one, and only that one, needed a scope.
 
 **WHY 3 AND 4 ARE NOT 2 AND NOT 0.** An undeclared-changes sweep by a
 non-author found that the refusal used to return 2 -- the same code as "nothing
@@ -209,6 +250,28 @@ EXIT_COLLECTION_INCOMPLETE = 5
 # 6 is not "failed" either. The test was never executed, so there is no
 # result for it, and the runner will not publish a count that omits it.
 EXIT_UNSUPPORTED_CONSTRUCT = 6
+# 7 is not a variant of 0, and keeping them apart is the whole of the --select
+# fix. A partial run has no result for the files it did not touch, and `rc == 0`
+# is the check every caller writes, so 0 is reserved for a run that covered the
+# whole tree. A partial run that FAILS still returns 1: a failure is a failure
+# at any scope, and this code must never become a way to soften one.
+#
+# TWO EXIT CONTRACTS LIVE IN THIS PACKAGE AND THEY ARE DISJOINT. DO NOT READ A
+# CODE FROM ONE AGAINST THE OTHER. `common.py` holds the M-MODULE PRODUCER
+# contract (0 DECIDED_CLEAN / 1 DECIDED_NOT_CLEAN / 2 COULD_NOT_RUN / 3
+# RAN_BUT_COULD_NOT_DECIDE, landed as Phase 0 P1); this file holds the TEST
+# RUNNER contract. `run_tests.py` does not import `common`, the two describe
+# different programs, and 7 was measured unclaimed in both before it was taken.
+#
+# ONE DIRECTION IS OPPOSITE TO THE SIBLING CONTRACT'S SAFETY PROPERTY AND IS
+# STATED RATHER THAN BURIED. P1 could say "every non-pass stays non-zero -- 3
+# is a refinement of what used to be 1, never a promotion to 0", so no caller
+# changed behaviour. 7 IS A DEMOTION FROM 0, so `run_tests.py --select x ||
+# fail` now fails where it used to pass. That is the intended effect and the
+# reason the code exists: the old 0 was the false claim. Measured before taking
+# it: zero callers of this runner exist anywhere in the tree outside this
+# package, so the blast radius of the demotion is this package.
+EXIT_PARTIAL_PASSED = 7
 
 TESTS_DIR = pathlib.Path(__file__).with_name("tests")
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -372,6 +435,42 @@ def test_files_on_disk() -> List[str]:
                   for p in TESTS_DIR.rglob("test_*.py"))
 
 
+def files_in_scope(select: Optional[str] = None) -> List[str]:
+    """The test files a run is ANSWERABLE FOR, given how it was invoked.
+
+    A full run is answerable for every file on disk. A ``--select`` run is
+    answerable for the files whose stem the selector matches -- the same test
+    ``collect`` applies -- and for nothing else, so reconciling a partial run
+    against the whole tree would refuse every partial run, which is why the
+    reconciliation used to be gated off entirely rather than scoped.
+
+    **WHERE THE SELECTOR NAMES TESTS RATHER THAN FILES THIS RETURNS THE EMPTY
+    LIST, AND AN EMPTY SCOPE IS NOT A CLEAN ONE.** The caller must not read the
+    resulting empty reconciliation as completeness; it is the absence of a
+    check, and ``run`` says so in the transcript rather than implying a pass.
+    """
+    on_disk = test_files_on_disk()
+    if select is None:
+        return on_disk
+    return [rel for rel in on_disk
+            if select in pathlib.PurePosixPath(rel).stem]
+
+
+def covered_files(
+        cases: Sequence[Tuple[str, str, Callable[[], Any]]]) -> List[str]:
+    """The test files this run actually collected a test from.
+
+    **THE DENOMINATOR OF A PARTIAL RUN COMES FROM HERE AND NEVER FROM
+    ``test_files_on_disk``.** That function is a recursive walk of the tree; it
+    answers "what exists", which is the right denominator for a run that
+    covered everything and a false one for a run that did not. Reporting
+    ``collected from 8 files`` after running one module was not a rounding
+    error in a message -- it was the widest available claim attached to the
+    narrowest available run.
+    """
+    return sorted({f"{module_name}.py" for module_name, _, _ in cases})
+
+
 def unsupported_constructs(
         cases: Sequence[Tuple[str, str, Callable[[], Any]]]) -> List[str]:
     """Collected tests this runner CANNOT execute, named one by one.
@@ -396,8 +495,13 @@ def unsupported_constructs(
 
 
 def uncollected_files(
-        cases: Sequence[Tuple[str, str, Callable[[], Any]]]) -> List[str]:
-    """Test files on disk that contributed no collected test.
+        cases: Sequence[Tuple[str, str, Callable[[], Any]]],
+        select: Optional[str] = None) -> List[str]:
+    """Test files IN SCOPE that contributed no collected test.
+
+    ``select`` narrows the scope to the files the selector matches, so the
+    check runs on a partial run instead of being skipped. It defaults to None,
+    which is the whole tree and the original behaviour exactly.
 
     THE COMPLETENESS CHECK CANNOT LIVE IN A TEST, AND THIS IS THE WHOLE POINT.
     A test asserting "the collector found every file" is itself in a file the
@@ -407,9 +511,11 @@ def uncollected_files(
     that made ``collect`` read only the first test file was caught by NOTHING,
     including the test written specifically to catch it.
 
-    So the reconciliation is performed BY THE RUNNER, on every full run, before
-    any count is printed. An instrument that can only be checked by the thing
-    it is measuring is not checked.
+    So the reconciliation is performed BY THE RUNNER, on every run, before any
+    count is printed. An instrument that can only be checked by the thing it is
+    measuring is not checked. On a ``--select`` run it is SCOPED rather than
+    skipped: it used to be gated off by ``if select is None``, which left the
+    narrowest run with no completeness check at all.
 
     TWO PROPERTIES, BOTH DELIBERATE, NEITHER A BUG:
 
@@ -423,21 +529,26 @@ def uncollected_files(
       result, but it CAN under-report a count to a reader who trusts it.
     """
     seen = {f"{module_name}.py" for module_name, _, _ in cases}
-    return [rel for rel in test_files_on_disk() if rel not in seen]
+    return [rel for rel in files_in_scope(select) if rel not in seen]
 
 
 def run(select: Optional[str] = None, verbose: bool = False) -> int:
     cases = collect(select)
-    if select is None:
-        missing = uncollected_files(cases)
-        if missing:
-            print(f"{BANNER}\nlaguna-phase0 fallback runner: COLLECTION IS "
-                  f"INCOMPLETE. {len(missing)} test file(s) on disk "
-                  f"contributed no test: {', '.join(missing)}.\n"
-                  "NO COUNT IS REPORTED. A green result over part of the "
-                  "corpus is worse than no result, because it looks like the "
-                  "whole corpus.")
-            return EXIT_COLLECTION_INCOMPLETE
+    partial = select is not None
+    # SCOPED, NOT GATED. The old form was `if select is None:` -- the only
+    # guard of its shape in this file -- and it meant a --select run
+    # reconciled nothing at all.
+    missing = uncollected_files(cases, select)
+    if missing:
+        print(f"{BANNER}\nlaguna-phase0 fallback runner: COLLECTION IS "
+              f"INCOMPLETE. {len(missing)} test file(s) on disk "
+              f"contributed no test: {', '.join(missing)}.\n"
+              "NO COUNT IS REPORTED. A green result over part of the "
+              "corpus is worse than no result, because it looks like the "
+              "whole corpus."
+              + (f"\nSCOPE: only the file(s) matching --select {select!r} "
+                 "were reconciled." if partial else ""))
+        return EXIT_COLLECTION_INCOMPLETE
     refused = unsupported_constructs(cases)
     if refused:
         print(f"{BANNER}\nlaguna-phase0 fallback runner: UNSUPPORTED "
@@ -474,6 +585,22 @@ def run(select: Optional[str] = None, verbose: bool = False) -> int:
               end="")
 
     passed = len(cases) - len(failures)
+    if partial:
+        covered = covered_files(cases)
+        # The denominator is what this run COVERED. `test_files_on_disk()` is
+        # deliberately not consulted here: it answers a question nobody asked.
+        print(f"\nlaguna-phase0 fallback runner (NOT pytest): "
+              f"{passed} passed, {len(failures)} failed, {len(cases)} collected "
+              f"from {len(covered)} selected file(s): {', '.join(covered)}\n"
+              f"PARTIAL RUN -- --select {select!r}. THIS IS NOT WHOLE-TREE "
+              "COVERAGE. The files this run did not touch have NO RESULT, not "
+              "a passing one. Re-run without --select for a suite verdict."
+              + ("" if files_in_scope(select) else
+                 "\nNOTE: the selector matched no FILE name, so the scoped "
+                 "completeness reconciliation had nothing to check and "
+                 "CLAIMS NOTHING."))
+        # 7, not 0. A partial FAILURE is still 1 -- scope never softens a fail.
+        return EXIT_SOMETHING_FAILED if failures else EXIT_PARTIAL_PASSED
     print(f"\nlaguna-phase0 fallback runner (NOT pytest): "
           f"{passed} passed, {len(failures)} failed, {len(cases)} collected "
           f"from {len(test_files_on_disk())} files")
