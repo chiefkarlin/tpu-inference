@@ -493,8 +493,8 @@ Quantities this module computes from interval arithmetic are confirmed by
 construction. `hbm_bytes` is declared **unconfirmed** and emits its unit as
 `UNKNOWN (claimed: bytes)` until a caller confirms it against the profiler's
 own documentation: a bytes/KiB/elements confusion does not produce an
-implausible number, it produces a different verdict. `m1.counter_units_confirmed`
-lists every counter still unconfirmed.
+implausible number, it produces a different verdict. `m1.counter_units`
+lists every counter still unconfirmed, and the confirmed ones beside them.
 
 `m1.reference_step_ms` exists in `thresholds.json` for orientation only. No leg
 reads it, and a test asserts that assessing a run never touches it.

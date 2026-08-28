@@ -189,14 +189,33 @@ def compare_with_spread(label: str,
     small effect".
     """
     declared = basis_mod.require_single_basis([before, after])
-    difference = (after.value or 0.0) - (before.value or 0.0)
+    # R8. This was `(after.value or 0.0) - (before.value or 0.0)`, and the
+    # coercion ran BOTH WAYS, which is worse than one direction: a missing
+    # `after` fabricated a difference equal to `before` -- "the mechanism
+    # acted" -- and two missing values fabricated a difference of exactly zero,
+    # the cleanest possible "no change". `or` also swallowed a legitimate
+    # measured 0.0, which is a measurement and not an absence.
+    #
+    # `is None`, never truthiness. An unread value is UNDETERMINED and the
+    # difference is left as None rather than as a number nobody measured.
+    unread = [name for name, point in (("before", before), ("after", after))
+              if point.value is None]
+    difference = None if unread else after.value - before.value
     intermediates: Dict[str, Any] = {
         "before": before.to_dict(),
         "after": after.to_dict(),
         "difference": difference,
+        "values_not_measured": unread,
         "basis": declared.value,
         "spread": spread.to_dict() if spread else None,
     }
+    if unread:
+        return common.check(
+            f"m2.comparison.{label}", common.Outcome.UNDETERMINED,
+            f"{' and '.join(unread)} was not measured, so no difference exists "
+            "to compare against the spread. This is not a difference of zero "
+            "and it is not no change",
+            intermediates)
     if spread is None or spread.stdev is None:
         return common.check(
             f"m2.comparison.{label}", common.Outcome.UNDETERMINED,

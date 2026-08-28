@@ -98,6 +98,64 @@ def test_a_comparison_without_a_spread_estimate_is_undetermined():
     assert chk.outcome is common.Outcome.UNDETERMINED
 
 
+# --------------------------------------------------------------------------
+# R8. `difference = (after.value or 0.0) - (before.value or 0.0)` coerced an
+# unread measurement to zero. The defect runs BOTH WAYS, which is worse than
+# one: a missing `after` fabricates a large difference ("the mechanism acted"),
+# two missing values fabricate a perfect null ("no change"). `or` also swallows
+# a legitimate measured 0.0.
+#
+# This is the exact comparison that separates "the mechanism acted" from
+# "something moved".
+# --------------------------------------------------------------------------
+
+
+def spread4():
+    return m2.summarise_replicates(CELL, "wall_time",
+                                   replicates([10.0, 10.5, 9.5, 10.2]))
+
+
+def test_a_missing_after_value_is_undetermined_not_a_large_difference():
+    chk = m2.compare_with_spread("phase1", point(10.0), point(None), spread4())
+    assert chk.outcome is common.Outcome.UNDETERMINED
+    assert chk.intermediates["difference"] is None
+    assert "not measured" in chk.reason
+
+
+def test_a_missing_before_value_is_undetermined_not_a_large_difference():
+    chk = m2.compare_with_spread("phase1", point(None), point(7.0), spread4())
+    assert chk.outcome is common.Outcome.UNDETERMINED
+    assert chk.intermediates["difference"] is None
+
+
+def test_two_missing_values_are_undetermined_and_never_a_perfect_null():
+    """The dangerous half. Fed nothing, this used to report a difference of
+    exactly 0.0, which reads as the cleanest possible "no change"."""
+    chk = m2.compare_with_spread("phase1", point(None), point(None), spread4())
+    assert chk.outcome is common.Outcome.UNDETERMINED
+    assert chk.intermediates["difference"] is None
+    assert chk.intermediates["difference"] != 0.0
+
+
+def test_a_measured_zero_is_a_measurement_and_is_not_swallowed():
+    """`or` treated a real 0.0 as absent. `is None` does not.
+
+    Both sides measured at 0.0 is a genuine null result, and it must reach the
+    spread comparison rather than being routed to UNDETERMINED with the
+    unread case.
+    """
+    chk = m2.compare_with_spread("phase1", point(0.0), point(0.0), spread4())
+    assert chk.outcome is common.Outcome.UNDETERMINED  # inside the spread
+    assert chk.intermediates["difference"] == 0.0
+    assert "NOT RESOLVABLE" in chk.reason
+
+
+def test_a_measured_zero_against_a_real_value_still_computes_the_difference():
+    chk = m2.compare_with_spread("phase1", point(0.0), point(7.0), spread4())
+    assert chk.outcome is common.Outcome.PASSED
+    assert chk.intermediates["difference"] == pytest.approx(7.0)
+
+
 def test_the_plan_renders_runs_and_runs_nothing():
     plan = m2.plan_replicate_commands(CELL, 4, ["bench", "--shape=B"])
     assert len(plan) == 4

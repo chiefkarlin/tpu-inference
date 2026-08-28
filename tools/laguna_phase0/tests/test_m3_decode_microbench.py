@@ -35,12 +35,86 @@ def timings(values=(18.0, 18.2, 17.9, 18.1, 18.0)):
 
 
 def test_the_design_threshold_is_not_readable():
-    """Review finding B8: the 1 ms threshold is overruled and held at null."""
+    """Review finding B8: the 1 ms threshold is overruled and held at null.
+
+    R6 changed WHY it is unreadable. It used to be unreadable only because its
+    value happened to be null, so `require()`'s raise was doing all the work
+    and doing it for the wrong reason. `entry()` now refuses on the KIND.
+    """
     th = thresholds()
-    assert th.entry("m3.design_stated_threshold_ms").value is None
-    assert th.entry("m3.design_stated_threshold_ms").kind == "rejected"
+    with pytest.raises(common.ThresholdError) as info:
+        th.entry("m3.design_stated_threshold_ms")
+    assert "rejected" in str(info.value)
+    with pytest.raises(common.ThresholdError):
+        th.require("m3.design_stated_threshold_ms")
     with pytest.raises(common.ThresholdError):
         th.require("m3.serving_stack_cost_threshold_ms")
+
+
+def test_supplying_a_value_to_the_rejected_threshold_does_not_reactivate_it():
+    """R6, and the leg that makes the previous test non-vacuous.
+
+    A test that only shows a null entry is unreadable cannot distinguish
+    "refused because the adjudication is closed" from "refused because the
+    number is missing". This one supplies the overruled number back and the
+    read must still fail -- otherwise the fix is decorative.
+    """
+    reactivated = {
+        "m3": {
+            "design_stated_threshold_ms": {
+                "value": 1.0,
+                "kind": "rejected",
+                "source": "a plausible, well-intentioned later edit",
+            }
+        }
+    }
+    th = common.Thresholds(reactivated, path="<reactivated fixture>")
+    with pytest.raises(common.ThresholdError):
+        th.entry("m3.design_stated_threshold_ms")
+    with pytest.raises(common.ThresholdError):
+        th.require("m3.design_stated_threshold_ms")
+
+
+def test_a_rejected_read_leaves_no_trace_in_provenance():
+    """The refusal is in entry(), so a rejected key is never served at all.
+
+    If it were only in require(), a caller reading the record "for provenance"
+    would still succeed and the value would travel into an artifact.
+    """
+    th = thresholds()
+    try:
+        th.entry("m3.design_stated_threshold_ms")
+    except common.ThresholdError:
+        pass
+    assert all(t["key"] != "m3.design_stated_threshold_ms"
+               for t in th.provenance())
+
+
+def test_a_deliberately_absent_threshold_says_so_by_name():
+    """R6's second half. "has no value" reads as an oversight."""
+    th = thresholds()
+    with pytest.raises(common.ThresholdError) as info:
+        th.require("m1.closure_residual_threshold")
+    assert "DELIBERATELY ABSENT" in str(info.value)
+
+
+def test_a_withdrawn_threshold_says_so_by_name_and_not_as_an_absence():
+    th = thresholds()
+    with pytest.raises(common.ThresholdError) as info:
+        th.require("m4.e1_disperse_reference")
+    assert "WITHDRAWN" in str(info.value)
+    assert "does not un-retire" in str(info.value)
+
+
+def test_a_threshold_without_a_source_is_refused_rather_than_labelled():
+    """Non-blocking: entry() used to default `source` to "UNSOURCED", which
+    puts an unsourced number into an artifact's provenance block wearing a
+    label instead of raising."""
+    unsourced = {"m3": {"made_up": {"value": 7.0, "kind": "input"}}}
+    th = common.Thresholds(unsourced, path="<unsourced fixture>")
+    with pytest.raises(common.ThresholdError) as info:
+        th.entry("m3.made_up")
+    assert "source" in str(info.value)
 
 
 def test_without_a_threshold_the_difference_is_published_and_undetermined():

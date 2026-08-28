@@ -680,6 +680,31 @@ def decide_efficiency(pair: Optional[EfficiencyPair],
             "comparable across runs",
             intermediates)
 
+    # R3. THIS TEST MUST STAY ABOVE THE FLOOR TEST BELOW, and the ordering is
+    # the whole fix. Zero and every negative are also below the 0.5 floor, so
+    # while the floor answered first this branch was UNREACHABLE and an
+    # impossible reading was reported as PASSED with a VOID verdict -- an
+    # orderly, legitimate-looking disposition.
+    #
+    # VOID is a result about the MACHINE: the reference kernel ran and did not
+    # reach a credible efficiency. FAILED is a result about the MEASUREMENT:
+    # the number we were handed cannot be a measurement of anything. Folding
+    # the second into the first is the axis collapse this module's two-axis
+    # design exists to prevent.
+    #
+    # It is hoisted above the FLOOR test only, and deliberately NOT above the
+    # same-run test: a non-positive reference imported from a different run is
+    # not comparable in the first place, and calling it an instrument fault
+    # would assert more than we know.
+    if pair.e_ref <= 0:
+        intermediates["verdict"] = EfficiencyVerdict.UNDETERMINED.value
+        return common.check(
+            name, common.Outcome.FAILED,
+            f"e_ref = {pair.e_ref} is non-positive, so the ratio is undefined. "
+            "An efficiency cannot be zero or negative; this is an instrument "
+            "fault and not a low reference, and it is NOT the VOID disposition",
+            intermediates)
+
     if pair.e_ref < floor:
         intermediates["verdict"] = EfficiencyVerdict.VOID.value
         return common.check(
@@ -690,12 +715,6 @@ def decide_efficiency(pair: Optional[EfficiencyPair],
             "read off it. This is a defined disposition, not a failure to "
             "measure",
             intermediates)
-
-    if pair.e_ref <= 0:
-        intermediates["verdict"] = EfficiencyVerdict.UNDETERMINED.value
-        return common.check(name, common.Outcome.FAILED,
-                            "e_ref is non-positive; the ratio is undefined",
-                            intermediates)
 
     ratio = pair.e_dec / pair.e_ref
     intermediates["ratio_e_dec_over_e_ref"] = ratio
@@ -856,8 +875,17 @@ def check_bucket_overlap(derivations: Sequence[StepDerivation],
 
 
 def check_counter_units(profiles: Sequence[DecodeStepProfile]) -> common.Check:
-    """Which emitted counters carry units nobody has confirmed."""
-    name = "m1.counter_units_confirmed"
+    """Which emitted counters carry units nobody has confirmed.
+
+    Named for the QUESTION and not for one of its answers. It was
+    ``m1.counter_units_confirmed``, which reads as an assertion that the units
+    are confirmed while the check's whole job is to list the ones that are not
+    -- so a reader skimming an artifact for check names saw a reassurance where
+    the payload holds the opposite. A deliberate rename closing a named review
+    nit, not tidying: the old name appears in no artifact in this repository
+    and in no other module.
+    """
+    name = "m1.counter_units"
     if not profiles:
         return common.check(name, common.Outcome.UNDETERMINED,
                             "nothing was emitted, so no units were declared",

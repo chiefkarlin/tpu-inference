@@ -50,9 +50,29 @@ SCHEMA = "laguna-phase0/1"
 
 DEFAULT_THRESHOLDS_PATH = pathlib.Path(__file__).with_name("thresholds.json")
 
+# Threshold kinds that are not ordinary numbers. Named as constants because a
+# string literal compared in one place is a rule nobody can find.
+REJECTED_KIND = "rejected"                      # overruled; must not be read
+DELIBERATELY_ABSENT_KIND = "deliberately-absent"  # must come from a measurement
+WITHDRAWN_KIND = "withdrawn"                    # retired from the decision path
+
 # Names whose *values* must never be written into an artifact. Presence and
 # length only. Matched case-insensitively against the environment variable
 # name, not against its value.
+#
+# THIS IS A DENYLIST AND IT FAILS OPEN. That is the whole caveat and it is
+# stated here rather than left to be discovered: a variable whose NAME does not
+# match one of these words has its VALUE written out in full. `SESSION`,
+# `COOKIE`, `SIGNATURE`, `PRIVATE`, `SALT`, `PEM`, `BEARER`, `SA_JSON`, and any
+# project-specific name at all, are not matched. A denylist can only ever be
+# as good as the last name somebody thought of.
+#
+# It is a denylist and not an allowlist because :func:`env_snapshot` is called
+# with an EXPLICIT LIST of variable names the caller wants recorded -- see
+# RECORDED_ENV in each module -- so the allowlist already exists, one level up,
+# and this is the second line rather than the first. If a caller ever passes an
+# unfiltered environment to env_snapshot, this pattern is not sufficient and
+# nothing here will say so.
 _SECRETISH = re.compile(r"TOKEN|SECRET|KEY|PASSWORD|PASSWD|CREDENTIAL|AUTH",
                         re.IGNORECASE)
 
@@ -125,7 +145,22 @@ class Thresholds:
         return self._path
 
     def entry(self, dotted_key: str) -> Threshold:
-        """Returns the threshold entry, without asserting it has a value."""
+        """Returns the threshold entry, without asserting it has a value.
+
+        Raises on ``kind == "rejected"`` REGARDLESS OF VALUE. See R6: before
+        this, no code path branched on ``kind`` at all, and the one rejected
+        entry in the file was unreadable only because its ``value`` happened to
+        be ``null`` -- the ``require()`` raise was doing the work, and doing it
+        for the wrong reason. Anyone later supplying a value to a rejected
+        entry, which is a plausible and well-intentioned edit because the entry
+        looks like every other threshold, would silently reactivate a number a
+        named party overruled. The failure would be quiet and permanent.
+
+        The raise is here in ``entry()`` and not in ``require()`` so that no
+        read of a rejected entry succeeds, including a read that only wants the
+        record for provenance. A rejected adjudication is closed; it is not a
+        value with a caveat.
+        """
         node: Any = self._data
         for part in dotted_key.split("."):
             if not isinstance(node, Mapping) or part not in node:
@@ -138,13 +173,38 @@ class Thresholds:
             raise ThresholdError(
                 f"threshold {dotted_key!r} in {self._path} is malformed: every "
                 "leaf must be an object with value/kind/source")
+        kind = node.get("kind", "unspecified")
+        if kind == REJECTED_KIND:
+            raise ThresholdError(
+                f"threshold {dotted_key!r} in {self._path} has kind "
+                f"{REJECTED_KIND!r} and MUST NOT BE READ, whatever its value "
+                f"currently is. {node.get('note') or node.get('source') or ''} "
+                "A named party overruled this number; supplying one here does "
+                "not reopen that. If it should be reopened, reopen it with "
+                "that party and change the kind, not the value")
         entry = Threshold(key=dotted_key,
                           value=node["value"],
-                          kind=node.get("kind", "unspecified"),
-                          source=node.get("source", "UNSOURCED"),
+                          kind=kind,
+                          # Non-blocking, review's own table: this default is
+                          # latent today because every leaf carries a source,
+                          # and a default is exactly how it stops being latent.
+                          # An unsourced threshold is not a threshold, so the
+                          # absence is raised rather than labelled.
+                          source=self._require_source(dotted_key, node),
                           note=node.get("note", ""))
         self._served[dotted_key] = entry
         return entry
+
+    def _require_source(self, dotted_key: str, node: Mapping[str, Any]) -> str:
+        source = node.get("source")
+        if not isinstance(source, str) or not source.strip():
+            raise ThresholdError(
+                f"threshold {dotted_key!r} in {self._path} has no 'source'. "
+                "Every leaf must carry value/kind/source; a number whose "
+                "origin is not recorded travels into an artifact's provenance "
+                "block as if it had one. Add the source, or stop and ask the "
+                "party who owns it")
+        return source
 
     def require(self, dotted_key: str) -> Any:
         """Returns the value, or raises if it is absent or null.
@@ -156,8 +216,22 @@ class Thresholds:
         """
         entry = self.entry(dotted_key)
         if entry.value is None:
+            # R6's second half: name the kind. "has no value" reads as an
+            # oversight; DELIBERATELY-ABSENT and WITHDRAWN are decisions, and a
+            # caller who cannot tell them apart from an omission will be
+            # tempted to supply the missing number.
+            qualifier = {
+                DELIBERATELY_ABSENT_KIND: (
+                    "it is DELIBERATELY ABSENT -- no defensible default exists "
+                    "and it must be supplied from a measurement"),
+                WITHDRAWN_KIND: (
+                    "it is WITHDRAWN -- a named party retired it from the "
+                    "decision path, and re-deriving the same number does not "
+                    "un-retire it"),
+            }.get(entry.kind, f"kind is {entry.kind!r}")
             raise ThresholdError(
-                f"threshold {dotted_key!r} has no value: {entry.note or entry.source}")
+                f"threshold {dotted_key!r} has no value; {qualifier}. "
+                f"{entry.note or entry.source}")
         return entry.value
 
     def provenance(self) -> List[Dict[str, Any]]:
@@ -264,6 +338,13 @@ def env_snapshot(names: Sequence[str]) -> Dict[str, Any]:
     Values are recorded for ordinary variables. For any name that looks like a
     credential, presence and length only -- never the value. This is a campaign
     constraint and it is enforced here so that no caller has to remember it.
+
+    THE REDACTION IS A DENYLIST AND IT FAILS OPEN. See ``_SECRETISH``. The
+    first line of defence is ``names``: this function records ONLY the
+    variables it is handed, so every caller in this package passes an explicit
+    ``RECORDED_ENV`` list. **Do not pass ``os.environ`` or any unfiltered
+    collection to this function.** If you do, an unrecognised credential name
+    is written out in full and nothing here will tell you.
     """
     out: Dict[str, Any] = {}
     for name in names:
