@@ -185,3 +185,30 @@ marked VOID on two independent grounds (the unwarmed bucket and the advancing
 counter). M0 gates strictly more than M6 does -- it is a precondition of every
 criterion in the design -- and until this control has been run on hardware **M0
 is written, not adopted.**
+
+## M2 -- `m2_replication.py`, and `basis.py`
+
+Replicates the Shape B (isl512/osl256) cell at **c32 and at c1**, at least four
+replicates each. c1 is review finding B8: without a spread estimate there, two
+later comparisons have one side with no precision basis at all -- including the
+criterion that separates "the mechanism acted" from "something moved".
+
+* **The raw values are always published.** There is no mode that emits a
+  coefficient of variation without the replicates it was computed from.
+* **A difference smaller than the measured spread is UNDETERMINED**, reported as
+  "not resolvable at this replication". Not "no effect", not "a small effect".
+  `compare_with_spread()` emits the spread next to every difference it computes.
+* **Too few replicates is UNDETERMINED**, and the cell stays an unreplicated
+  point estimate.
+
+`basis.py` is the other half of this and it exists because of review finding
+B3: a residual curve was assembled from wall-clock and TPOT-derived points, and
+the mix understated a load-bearing term by about 57%. A measured point in this
+package is never a bare float -- it is a `LadderPoint` carrying its concurrency,
+units, basis and instrument, and every combining operation calls
+`require_single_basis()` first. An `UNKNOWN` basis is not a wildcard: it is a
+point that cannot be combined with anything.
+
+`plan` renders the replicate invocations without running them; `summarise`
+ingests the results, and requires `--basis` on the command line because an
+ingest that guesses the basis reintroduces the defect.
