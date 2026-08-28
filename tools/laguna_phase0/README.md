@@ -8,10 +8,37 @@ histogram) and M6 (denominator assertion).
 
 ## STATUS: WRITTEN AND REVIEWED. NOT ADOPTED.
 
-**Nothing in this directory has ever been executed.** No server, no benchmark, no
-measurement run, no unit test. That is deliberate: the work was produced without
-run authorisation, and a check that has never been made to fail is not an adopted
-check.
+### The previous STATUS text, quoted and superseded
+
+Left standing rather than deleted, because a reader who saw it needs to know what
+it said and that it was wrong, not merely find something else in its place:
+
+> **Nothing in this directory has ever been executed.** No server, no benchmark, no
+> measurement run, no unit test. That is deliberate: the work was produced without
+> run authorisation, and a check that has never been made to fail is not an adopted
+> check.
+
+**THE CLAUSE "NO UNIT TEST" IS FALSE AND HAS BEEN FOR SOME TIME.** So is the
+statement further down that *"the other five test files have not been collected or
+run"*. `run_tests.py` collects and executes **eight** test files. A stale disclaimer
+is not the safe default it looks like: it invites a reader to discount a real result,
+and it costs the document its credit on the claims that are still true.
+
+### What is true, and the two things that are not the same
+
+**NOTHING IN THIS DIRECTORY HAS EVER TOUCHED HARDWARE.** No server, no benchmark, no
+measurement run, no TPU, no GPU, no cluster. That part of the old text was right and
+is unchanged. The work was produced without run authorisation.
+
+**The unit tests are collected and executed**, in-process, over synthetic inputs, by
+`run_tests.py` — which is **not** `pytest` and supports far less. A passing count from
+it means "collected and executed by the fallback runner, and none raised". It does not
+mean the package is adopted, and it says nothing whatever about hardware.
+
+A check that has never been made to fail is not an adopted check. That standard is
+unchanged, and by it most of this package is still unadopted — see the control table
+below, where the *"executed?"* column is the honest answer and the majority of it
+reads **no**.
 
 Two items in particular are only adopted once they have been *made to fail* on
 hardware, and making them fail is a run:
@@ -32,8 +59,39 @@ red, which they did. Those tests are pure in-process code over synthetic inputs:
 no hardware, no server, no benchmark, the same class as the E6b decider
 fixtures. `pytest` is not installed in the authoring container and no package
 manager is available, so they were executed through a throwaway shim providing
-`raises` only; the shim is **not** in this repository. **The other five test
-files have not been collected or run.**
+`raises` only; the shim is **not** in this repository. ~~**The other five test
+files have not been collected or run.**~~ **THAT SENTENCE IS SUPERSEDED AND IS
+STRUCK RATHER THAN REMOVED.** `run_tests.py` now collects and executes all eight
+test files in `tests/`. The throwaway shim it describes has been replaced by that
+runner, which **is** in this repository and can be re-run by anyone.
+
+### R11 — WHICH CONTROLS HAVE A RECORDED FIRING, AND WHICH ONLY A RECORDED EXISTENCE
+
+**These are two different questions and the package answers them with two different
+mechanisms that do not meet.** The table above has an *"executed?"* column, but the
+machine-readable field behind it does not cover the same set of controls:
+
+| control | mechanism | can record a firing? | has fired? |
+|---|---|---|---|
+| M0 unwarmed bucket | `common.NegativeControl`, `executed` flag, attached to the artifact via `write_artifact(negative_control=...)` | yes | **no** — needs hardware |
+| M6 leg 1, wrong chip count | same | yes | **no** — needs hardware |
+| M6 leg 2, inconsistent pairing | same | yes | **no** — needs hardware |
+| M4 counter controls c1/c16 | an ordinary `common.check` named `m4.counter_negative_control` | **no such field exists on this path** | **yes, every run**, synthetic |
+| M4 stuck-at-cut mutant | same, inside the same check | **no such field exists on this path** | **yes, every run**, synthetic |
+| M1, M1 fixtures, M2, M3 | none of either kind | — | — |
+
+**THE CONSEQUENCE IS THE FINDING.** The `NegativeControl.executed` field — the field
+whose entire purpose is to answer *"has this control ever fired?"* — is attached
+**only** to the controls that have never fired. The controls that **do** fire, on
+every single run, do not use it and are invisible to it. Anyone auditing
+`negative_control.executed` across the emitted artifacts sees a uniform `false` and
+concludes that no control in this package has ever fired. **That conclusion is
+correct about the controls they can see and false about the package.**
+
+The error runs in the unflattering direction here, which is why it has survived: it
+understates what has been verified. It is still an instrument that cannot answer the
+question it was built for, and the same structure pointed the other way would be a
+serious misreport.
 
 ## Standing rules this package enforces in code
 
