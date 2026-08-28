@@ -83,7 +83,8 @@
     "e32_reference": {
       "value": 183,
       "kind": "constant",
-      "source": "optimization-design.md section 7, M4 (byte model stands if E(32) is within 10% of 183)"
+      "source": "optimization-design.md section 7, M4 (byte model stands if E(32) is within 10% of 183)",
+      "note": "PROVENANCE FLAG, ESCALATED AND NOT ACTED ON. 183 reproduces MODEL B -- the WRONG uniform model, with replacement -- at 32 rows to three digits (182.83). MODEL A, the correct one, gives 184.47. IF this reference were re-pointed at model A, THEN the pass band would move by about 0.9% of itself and no realistic measurement would change disposition -- that is a SENSITIVITY, NOT A MEASUREMENT. It is NOT re-pointed here: the constant is the architect's to move and the question is routed to laguna-tpu-opt-arch-2. A further question is routed with it: whether the objection that retired the c1 anchor -- model output standing in for a measurement, and a ceiling rather than a centre -- also reaches this leg, which puts a SYMMETRIC 10% band around a ceiling one ladder point over."
     },
     "e32_tolerance_fraction": {
       "value": 0.1,
@@ -91,23 +92,73 @@
       "source": "optimization-design.md section 7, M4"
     },
     "e1_disperse_reference": {
-      "value": 119,
-      "kind": "constant",
-      "source": "optimization-design.md section 7, M4 (E(1) near 119 => padding rows disperse)"
+      "value": null,
+      "kind": "withdrawn",
+      "retired_value": 119,
+      "source": "RETIRED FROM THE DECISION PATH by the architect, 2026-08-28 17:07Z, ruled as DECIDED AND NOT AS AN ABSTENTION. Two reasons, and NEITHER IS FIXED BY A BETTER MODEL: (1) it is a MODEL OUTPUT STANDING IN FOR A MEASUREMENT, and the model it comes from carries the exact uniform-routing assumption M4 exists to test; (2) it is a CEILING, NOT A CENTRE -- any correlation between rows puts the true value below it, with no lower limit short of top-k -- so a symmetric band around it is WRONG IN FORM, not merely in width. DO NOT RE-POINT THIS AT 120.68. OPT-1850 established that 119.14 came from the wrong uniform model and that the correct model gives 120.68; OPT-1860 established that this makes the anchor MORE dangerous, not less, because a correct number reads as safe to reinstate. The retirement was never about the value being wrong. It was about the quantity being MODELLED AT ALL. The replacement rule is structural: cut = top_k_runtime + n_shared_counted, with no tolerance in it anywhere.",
+      "note": "Left PRESENT with a null value rather than deleted, deliberately. A retired quantity left as an ABSENCE is a retired quantity waiting to be re-derived: a hole is what a future reader fills with the better number. Thresholds.require() raises on null, so any code that reaches for this anchor dies loudly instead of receiving a plausible float."
     },
     "e1_no_disperse_band": {
-      "value": [
+      "value": null,
+      "kind": "withdrawn",
+      "retired_value": [
         10,
         20
       ],
-      "kind": "constant",
-      "source": "optimization-design.md section 7, M4 (E(1) of 10-20 => padding rows do not disperse)"
+      "source": "RETIRED FROM THE DECISION PATH by the architect, 2026-08-28 17:07Z, ruled as DECIDED AND NOT AS AN ABSTENTION. Two reasons, and NEITHER IS FIXED BY A BETTER MODEL: (1) it is a MODEL OUTPUT STANDING IN FOR A MEASUREMENT, and the model it comes from carries the exact uniform-routing assumption M4 exists to test; (2) it is a CEILING, NOT A CENTRE -- any correlation between rows puts the true value below it, with no lower limit short of top-k -- so a symmetric band around it is WRONG IN FORM, not merely in width. DO NOT RE-POINT THIS AT 120.68. OPT-1850 established that 119.14 came from the wrong uniform model and that the correct model gives 120.68; OPT-1860 established that this makes the anchor MORE dangerous, not less, because a correct number reads as safe to reinstate. The retirement was never about the value being wrong. It was about the quantity being MODELLED AT ALL. The replacement rule is structural: cut = top_k_runtime + n_shared_counted, with no tolerance in it anywhere.",
+      "note": "Left PRESENT with a null value rather than deleted, deliberately. A retired quantity left as an ABSENCE is a retired quantity waiting to be re-derived: a hole is what a future reader fills with the better number. Thresholds.require() raises on null, so any code that reaches for this anchor dies loudly instead of receiving a plausible float."
     },
     "e1_disperse_tolerance_fraction": {
       "value": null,
-      "kind": "input",
-      "source": "NOT STATED BY ANY NAMED PARTY. The design says E(1) 'near 119' without a tolerance, and the developer did not invent one; escalated to laguna-tpu-opt-em.",
-      "note": "Until a named party supplies it, the dispersal leg of M4 reports COULD_NOT_BE_CHECKED_MECHANICALLY and publishes the distance from 119 as an intermediate. The 'do not disperse' leg needs no tolerance: the design states the band 10-20 exactly."
+      "kind": "withdrawn",
+      "retired_value": null,
+      "source": "RETIRED FROM THE DECISION PATH by the architect, 2026-08-28 17:07Z, ruled as DECIDED AND NOT AS AN ABSTENTION. Two reasons, and NEITHER IS FIXED BY A BETTER MODEL: (1) it is a MODEL OUTPUT STANDING IN FOR A MEASUREMENT, and the model it comes from carries the exact uniform-routing assumption M4 exists to test; (2) it is a CEILING, NOT A CENTRE -- any correlation between rows puts the true value below it, with no lower limit short of top-k -- so a symmetric band around it is WRONG IN FORM, not merely in width. DO NOT RE-POINT THIS AT 120.68. OPT-1850 established that 119.14 came from the wrong uniform model and that the correct model gives 120.68; OPT-1860 established that this makes the anchor MORE dangerous, not less, because a correct number reads as safe to reinstate. The retirement was never about the value being wrong. It was about the quantity being MODELLED AT ALL. The replacement rule is structural: cut = top_k_runtime + n_shared_counted, with no tolerance in it anywhere.",
+      "note": "Left PRESENT with a null value rather than deleted, deliberately. A retired quantity left as an ABSENCE is a retired quantity waiting to be re-derived: a hole is what a future reader fills with the better number. Thresholds.require() raises on null, so any code that reaches for this anchor dies loudly instead of receiving a plausible float."
+    },
+    "top_k_expected": {
+      "value": 10,
+      "kind": "assertion",
+      "source": "INHERITED from laguna-tpu-opt-arch, received as bench-campaign/evidence/opt/em-succession.md at commit 64a3e599 section 4. Cited to that document per the citation rule; the sources it names were NOT opened or re-derived here. The checkpoint's own config.json gives num_experts_per_tok = 10, authoritative, corroborated by four independent load-time readings.",
+      "note": "ASSERTED, NOT USED AS A FALLBACK. The runtime reading is what forms the cut; this value is what the runtime reading is checked against. If top-k cannot be read from the running model the answer is UNDETERMINED, never this number."
+    },
+    "top_k_known_wrong_values": {
+      "value": {
+        "8": "the vLLM config-class default -- THE SERVING STACK'S OWN FALLBACK. A clean, non-dispersing system measures 8, lands below the cut and is filed as INSTRUMENT FAULT: a correct result routed into the do-not-classify bucket.",
+        "16": "the HF default. A clean, non-dispersing system measures 16, lands above the cut and reports DISPERSAL CONFIRMED."
+      },
+      "kind": "constant",
+      "source": "INHERITED from laguna-tpu-opt-arch, received as bench-campaign/evidence/opt/em-succession.md at commit 64a3e599 section 4. Cited to that document per the citation rule; the sources it names were NOT opened or re-derived here.",
+      "note": "Both wrong values are reachable BY READING A REAL FILE IN A REAL DIRECTORY, which is why the reading must come from the running model's effective config and why a reading that parses cleanly is not thereby a reading of what the model used."
+    },
+    "shared_experts_per_moe_layer": {
+      "value": 1,
+      "kind": "constant",
+      "source": "INHERITED from laguna-tpu-opt-arch, received as bench-campaign/evidence/opt/em-succession.md at commit 64a3e599 section 4. Cited to that document per the citation rule; the sources it names were NOT opened or re-derived here. One shared expert per MoE layer, always on, outside the router as a separate dense matmul.",
+      "note": "This value does NOT decide n_shared_counted. Whether the shared expert lands in the count is a fact about WHERE THE PROBE IS, not about the model: routed GMM/Megablox rows only -> 0; experts whose weights were read -> 1. The counter declares which."
+    },
+    "moe_layer_count": {
+      "value": 47,
+      "kind": "constant",
+      "source": "INHERITED from laguna-tpu-opt-arch, received as bench-campaign/evidence/opt/em-succession.md at commit 64a3e599 section 4. Cited to that document per the citation rule; the sources it names were NOT opened or re-derived here. 47 layers carry shared-expert weights, exactly the MoE layers.",
+      "note": "Inherited and NOT audited here. A capture covering a different number of layers is reported UNDETERMINED rather than FAILED, because this module cannot tell a probe that missed layers from an inherited count that is wrong."
+    },
+    "window_steps_required": {
+      "value": 1,
+      "kind": "constant",
+      "source": "INHERITED from laguna-tpu-opt-arch, received as bench-campaign/evidence/opt/em-succession.md at commit 64a3e599 section 4. Cited to that document per the citation rule; the sources it names were NOT opened or re-derived here. Per-step, never pooled (architect, hard).",
+      "note": "Not a tuning parameter and not a tolerance. A count unioned over S steps is a DIFFERENT QUANTITY, not a noisy per-step count: it rises with S and crosses the cut with certainty, and the downstream statistic is NON-MONOTONIC in S, so two honest runs at different window lengths return different answers with no disagreement between them."
+    },
+    "num_experts": {
+      "value": 256,
+      "kind": "constant",
+      "source": "INHERITED from laguna-tpu-opt-arch, received as bench-campaign/evidence/opt/em-succession.md at commit 64a3e599 section 4. Cited to that document per the citation rule; the sources it names were NOT opened or re-derived here. num_experts = 256 in the checkpoint config.",
+      "note": "Used only by the ILLUSTRATIVE uniform-expectation helper and by the model discriminator. Reachable from no decision path."
+    },
+    "padded_block_rows": {
+      "value": 16,
+      "kind": "constant",
+      "source": "INHERITED from laguna-tpu-opt-arch, received as bench-campaign/evidence/opt/em-succession.md at commit 64a3e599 section 4. The routing block is 16 rows.",
+      "note": "A CONFIGURATION FACT, not a measurement and not a model output. It is what makes dispersal a c1 phenomenon by construction: at c1 the block holds 1 real token and 15 padding rows, at c16 it holds 16 real tokens and NO padding rows, so padding-row dispersal raises E(1) and does not move E(16). Recorded here rather than left as a literal so that a different block size cannot silently keep the old padding-row count."
     }
   },
   "m6": {

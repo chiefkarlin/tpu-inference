@@ -21,9 +21,19 @@ hardware, and making them fail is a run:
 | M0 negative control | leaves a padding bucket unwarmed, so the timed window recompiles | `m0_warm_cache.py --nc-leave-bucket-unwarmed <bucket>` | **no** |
 | M6 leg 1 | injects a wrong chip count | `m6_denominator.py --nc-chip-count-scale <k>` | **no** |
 | M6 leg 2 | injects an inconsistently paired basis (per-device FLOPs against per-chip bandwidth) | `m6_denominator.py --nc-inconsistent-pairing` | **no** |
+| M4 counter control, c1 and c16 | feeds the counter a known distinct count that is not the cut | `check_counter_controls()`, run automatically in `assess()` | **yes -- synthetic, no hardware** |
+| M4 stuck-at-cut mutant | replaces the counter with one that always reports the cut | `stuck_at_cut_counter`, run inside the control | **yes -- synthetic, no hardware** |
 
-The presence of a test file in `tests/` is not evidence that the test passes. The
-tests have not been collected or run either.
+The presence of a test file in `tests/` is not evidence that the test passes.
+**One exception, and it is stated rather than left to be noticed:**
+`tests/test_m4_router_histogram.py` **was run** -- 37 tests, 37 passing -- and
+four deliberate mutations of the M4 rules were each required to turn named tests
+red, which they did. Those tests are pure in-process code over synthetic inputs:
+no hardware, no server, no benchmark, the same class as the E6b decider
+fixtures. `pytest` is not installed in the authoring container and no package
+manager is available, so they were executed through a throwaway shim providing
+`raises` only; the shim is **not** in this repository. **The other five test
+files have not been collected or run.**
 
 ## Standing rules this package enforces in code
 
@@ -272,52 +282,119 @@ candidate: its result selects the Phase 1 candidate.
   summary `E`. The summary is a verdict; the histogram is the intermediate.
 * **Every ladder point carries its basis on the point** (`router_count`) and the
   counter's units and source next to the value.
+* **Every check is named with its ladder point** (`m4.window_length@c16`).
+  Three captures produce three copies of each check with different
+  intermediates, and an unqualified name is how a c16 pass gets read as
+  covering c1.
 * **The c1 and c16 points are emitted in a form that can feed the Phase 1
   naming statistic. This module does not compute that statistic and does not
   name a candidate.**
 
-Acceptance:
+### The dispersal leg was replaced wholesale on 2026-08-28
+
+An earlier version classified `E(1)` against a stated band of `10-20` and a
+reference value of `119`, and partitioned the line into three regions around
+them. **Both anchors are retired from the decision path** -- architect, 17:07Z,
+ruled as DECIDED and not as an abstention -- and the region machinery went with
+them. `119` is not a measurement: it is a uniform-routing model output, so it
+carries the exact assumption M4 exists to test, and it is a **ceiling, not a
+centre**, so a symmetric band around it is wrong in form and not merely in
+width.
+
+**A later ruling established that `119.14` came from the wrong uniform model and
+that the correct one gives `120.68`. That does not un-retire the anchor, and the
+corrected number is the more dangerous of the two:** `119.14` was easy to retire
+because it was about to be shown wrong, while `120.68` arrives independently
+re-derived and combinatorially correct and therefore reads as safe to put back.
+The retirement was never about the value being wrong. It was about the quantity
+being modelled at all.
+
+So the three anchor entries in `thresholds.json` are **present, null, and
+`kind: withdrawn`**, each carrying the retirement reason in its `source` field.
+They are not deleted, because `Thresholds.require()` raises on null: any future
+code reaching for an anchor dies loudly instead of receiving a plausible float,
+somebody searching for `119` finds the retirement rather than silence, and
+somebody reinstating `120.68` has to delete a sentence explaining why they must
+not. **A retired quantity left as an absence is a retired quantity waiting to be
+re-derived.**
+
+### The replacement rule is structural and has no tolerance in it anywhere
+
+At c1 there is exactly one real token and top-k selects exactly top-k *distinct*
+experts, so real routing can touch at most `cut` distinct experts per MoE layer
+per step -- by construction, not approximately.
+
+```
+cut = top_k_runtime + n_shared_counted
+```
+
+| observed, **per MoE layer, per step** | verdict | outcome |
+|---|---|---|
+| `E(1) == cut` everywhere | `NON_DISPERSAL_CONFIRMED` | PASSED |
+| `E(1) > cut` anywhere | `DISPERSAL_CONFIRMED` | PASSED |
+| `E(1) < cut` anywhere | `INSTRUMENT_FAULT_OR_CAPACITY_DROPPING` | FAILED -- report and stop, **not** a hypothesis result |
+| cut not established | `NOT_CLASSIFIED` | COULD_NOT_BE_CHECKED_MECHANICALLY |
+
+Both hypothesis arms now reach PASSED from a config fact rather than from a
+model, and the one confirmed most sharply is **dispersal, the damaging one**.
+The known bias the previous version had to declare -- that only non-dispersal
+could be confirmed -- is gone, because the anchors created it and it died with
+them.
+
+The rule runs over **every individual (layer, step) observation, never the
+mean**. A per-layer mean sitting exactly on the cut is consistent with half the
+steps above it, and the excess is the entire phenomenon.
+
+### Three things the counter must say, or its number means nothing
+
+| declaration | why a bare number is unreadable without it |
+|---|---|
+| **which instrumentation point it counted** | one shared expert per MoE layer, always on, outside the router. Routed GMM/Megablox rows only -> `n_shared_counted = 0`; experts whose weights were read -> `1`. **A counter reporting 11 is a clean system counting the shared expert or a dispersing system that is not -- identical output, opposite verdicts.** An undeclared basis yields no cut, and is *not* resolved by assuming 0 |
+| **what top-k actually was**, from the running model's effective config | three values are reachable by reading a real file in a real directory: **10** authoritative from the checkpoint, **8** the serving stack's own config-class default, **16** the framework default. A wrong constant produces a confident wrong verdict, and the two wrong arms fail in opposite directions -- 8 files a clean result as INSTRUMENT FAULT, 16 reports DISPERSAL CONFIRMED on a clean system. A reading from a file on disk is UNDETERMINED; a hardcoded one is FAILED even when the constant is right today |
+| **its window length** | per-step, never pooled. A count unioned over a window rises with the step count and crosses the cut with certainty. Worse than a bias: the downstream statistic is **non-monotonic** in the window length, so two honest runs at different window lengths return different answers with no disagreement between them |
+
+### Acceptance
 
 | leg | rule | source |
 |---|---|---|
-| byte model | E(32) within 10% of 183 | design section 7, M4 |
-| padding rows do NOT disperse | E(1) in the band 10-20 | design section 7, M4 |
-| padding rows DO disperse | E(1) "near 119" -- **no tolerance exists** | -- |
+| byte model | `E(32)` within 10% of 183 | design section 7, M4 |
+| dispersal | the structural table above | architect, 2026-08-28 17:07Z |
 
-No named party has supplied a tolerance for "near". Borrowing the 10% designed
-for E(32) would be inventing one for a different quantity at a different
-concurrency, so `m4.e1_disperse_tolerance_fraction` stays null with the
-escalation recorded in its source field. The ruling is outstanding with the
-architect, who is the only party who can supply it, because a tolerance around
-a prediction depends on how the prediction was derived.
+**A flag on the byte-model reference, escalated and not acted on.** `183`
+reproduces the *wrong* uniform model (with replacement) at 32 rows to three
+digits -- 182.83 -- where the correct model gives 184.47. IF the reference were
+re-pointed at the correct model, THEN the pass band would move by about 0.9% of
+itself and no realistic measurement would change disposition; **that is a
+sensitivity, not a measurement.** The constant is the architect's to move, so it
+is kept exactly as the brief specifies and the correct value is emitted beside
+it **labelled model A, marked placeholder, illustrative only**. Two questions
+are routed with it: whether the reference should move, and whether the objection
+that retired the c1 anchor also reaches a symmetric 10% band around a ceiling
+one ladder point over.
 
-### The dispersal leg partitions the whole line into three named regions
+`uniform_distinct_expected()` exists for that labelled illustration and is
+reachable from **no decision path**. Its wrong sibling is kept beside it only so
+that `discriminate_uniform_models()` can *execute* the discriminator rather than
+assert it: at one row the answer is exactly top-k by construction, and the wrong
+model returns 9.826. **Reproducing a formula's arithmetic cannot detect the
+wrong formula** -- it tests transcription and nothing else.
 
-| region | condition | outcome |
-|---|---|---|
-| `NON_DISPERSAL_BAND` | E(1) in 10-20 | PASSED, padding rows do not disperse |
-| `DISPERSAL_NEIGHBOURHOOD_PENDING_TOLERANCE` | E(1) around 119 | COULD_NOT_BE_CHECKED_MECHANICALLY, pending the architect |
-| `NEITHER_NEIGHBOURHOOD` | E(1) in neither | FAILED -- **neither prediction in the design holds** |
+### The negative control runs at both c1 and c16, and it has been made to fail
 
-The third region exists because a two-way test with an abstention bolted onto
-one arm files two different findings under one label. E(1) = 119.4 means "the
-dispersal reading looks right and we lack a tolerance". E(1) = 60 means
-"neither prediction in the design holds" -- a substantive result about the
-design, and the one nobody would go looking for if it were filed under a word
-meaning "we could not tell".
+The counter is fed synthetic routing blocks whose distinct count is **known and
+is not the cut**, and must not report the cut. It runs at two points, not one:
+the downstream statistic's sensitivities to `E(1)` and `E(16)` have opposite
+signs and largely cancel, so it is about four times more exposed to a counter
+that miscounts *differently* at the two points than to one that miscounts
+uniformly -- and **dispersal is a c1 phenomenon by construction**, because the
+block is 16 rows and c1 holds 1 real token with 15 padding rows while c16 holds
+16 real tokens with none. The differential error class is exactly the shape of
+the phenomenon under test, so a single-point control tests the wrong thing.
 
-Both discriminators are derived from the two anchors the design already states;
-no new number is introduced. A point outside the band is NEITHER when it is
-nearer the band than 119 -- it missed the only exactly stated criterion and is
-not even closer to the rival -- or when it is further from 119 than the two
-hypotheses are from each other, since a tolerance that wide would swallow the
-band whole and the two predictions would stop being distinguishable. Between
-those, the partition is deliberately conservative and returns PENDING: only a
-tolerance can settle it, and inventing one is the thing being avoided.
-
-**Distance to BOTH anchors is published on every result**, plus the gap between
-them. Distance to 119 alone cannot separate PENDING from NEITHER; the pair can,
-with no tolerance ruled at all.
+**Ask what the failure mode grants:** a counter stuck at the cut grants
+NON-DISPERSAL, the comfortable answer, and would pass the non-dispersal leg
+perfectly on every layer forever. So `stuck_at_cut_counter` is run against both
+legs and the control must reject it; if it does not, the control itself FAILS.
 
 ### A known bias in this leg, emitted in the output
 
