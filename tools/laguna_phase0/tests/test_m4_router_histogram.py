@@ -79,19 +79,80 @@ def test_an_empty_capture_is_undetermined_never_pass():
 def test_e1_inside_the_stated_band_says_padding_rows_do_not_disperse():
     chk = m4.check_padding_dispersal(capture(1, [12, 14]), thresholds())
     assert chk.outcome is common.Outcome.PASSED
+    assert chk.intermediates["region"] == "NON_DISPERSAL_BAND"
     assert "do NOT disperse" in chk.reason
 
 
-def test_e1_near_the_disperse_reference_is_undetermined_for_want_of_a_tolerance():
-    """'Near 119' has no tolerance from any named party, so the leg abstains."""
+def test_e1_near_the_disperse_reference_is_pending_a_tolerance_not_unmeasurable():
+    """'Near 119' has no tolerance from any named party, so the leg abstains.
+
+    But it abstains under its own label. Pending a ruling is a different state
+    from not being able to tell, and the region name says which one this is.
+    """
     chk = m4.check_padding_dispersal(capture(1, [119, 119]), thresholds())
     assert chk.outcome is common.Outcome.UNDETERMINED
+    assert chk.intermediates["region"] == "DISPERSAL_NEIGHBOURHOOD_PENDING_TOLERANCE"
     assert chk.intermediates["distance_from_disperse_reference"] == 0.0
+
+
+def test_e1_in_neither_neighbourhood_is_its_own_finding_and_not_an_abstention():
+    """E(1) = 60 means neither prediction in the design holds.
+
+    Under the old two-way shape this returned the same label as 119.4, which
+    filed 'the design is wrong' under a word meaning 'we could not tell'.
+    """
+    chk = m4.check_padding_dispersal(capture(1, [60, 60]), thresholds())
+    assert chk.outcome is common.Outcome.FAILED
+    assert chk.intermediates["region"] == "NEITHER_NEIGHBOURHOOD"
+    assert "finding about the design" in chk.reason
+
+
+def test_a_value_further_from_119_than_the_rival_hypothesis_is_also_neither():
+    """Any tolerance admitting E(1) = 400 would swallow the band whole."""
+    assert m4.classify_dispersal(400.0, [10.0, 20.0], 119.0, None) is (
+        m4.DispersalRegion.NEITHER_NEIGHBOURHOOD)
+
+
+def test_a_value_below_the_band_is_neither_rather_than_pending():
+    assert m4.classify_dispersal(5.0, [10.0, 20.0], 119.0, None) is (
+        m4.DispersalRegion.NEITHER_NEIGHBOURHOOD)
+
+
+def test_the_partition_is_conservative_in_the_strip_between_the_hypotheses():
+    """Documenting where it declines to convict rather than hiding it.
+
+    E(1) = 70 is nearer 119 than the band and within the gap, so it comes back
+    PENDING rather than NEITHER. That is deliberate: only a tolerance would
+    settle it, and inventing one is the thing being avoided.
+    """
+    assert m4.classify_dispersal(70.0, [10.0, 20.0], 119.0, None) is (
+        m4.DispersalRegion.DISPERSAL_PENDING_TOLERANCE)
+
+
+def test_a_ruled_tolerance_resolves_the_pending_region_without_touching_the_rest():
+    assert m4.classify_dispersal(119.4, [10.0, 20.0], 119.0, 0.05) is (
+        m4.DispersalRegion.DISPERSAL_NEIGHBOURHOOD)
+    assert m4.classify_dispersal(60.0, [10.0, 20.0], 119.0, 0.05) is (
+        m4.DispersalRegion.NEITHER_NEIGHBOURHOOD)
+
+
+def test_both_distances_are_always_published():
+    """Distance to 119 alone cannot separate 'pending' from 'neither'."""
+    chk = m4.check_padding_dispersal(capture(1, [60, 60]), thresholds())
+    assert chk.intermediates["distance_from_disperse_reference"] == -59.0
+    assert chk.intermediates["distance_from_no_disperse_band"] == 40.0
+    assert chk.intermediates["gap_between_the_two_hypotheses"] == 99.0
+
+
+def test_the_leg_declares_its_own_bias_in_the_output():
+    chk = m4.check_padding_dispersal(capture(1, [12, 14]), thresholds())
+    assert "confirm only NON-dispersal" in chk.intermediates["known_bias"]
 
 
 def test_a_capture_that_does_not_record_padding_rows_cannot_answer_the_question():
     chk = m4.check_padding_dispersal(capture(1, [119, 119], padding=None), thresholds())
     assert chk.outcome is common.Outcome.UNDETERMINED
+    assert chk.intermediates["region"] == "NOT_ESTABLISHED"
     assert "padding rows" in chk.reason
 
 

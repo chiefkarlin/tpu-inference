@@ -284,14 +284,53 @@ Acceptance:
 | padding rows do NOT disperse | E(1) in the band 10-20 | design section 7, M4 |
 | padding rows DO disperse | E(1) "near 119" -- **no tolerance exists** | -- |
 
-The dispersal leg reports `COULD_NOT_BE_CHECKED_MECHANICALLY` and publishes the
-distance from 119. No named party has supplied a tolerance for "near", and
-borrowing the 10% that was designed for E(32) would be inventing one;
-`m4.e1_disperse_tolerance_fraction` is present in `thresholds.json` with value
-null and the escalation recorded in its source field.
+No named party has supplied a tolerance for "near". Borrowing the 10% designed
+for E(32) would be inventing one for a different quantity at a different
+concurrency, so `m4.e1_disperse_tolerance_fraction` stays null with the
+escalation recorded in its source field. The ruling is outstanding with the
+architect, who is the only party who can supply it, because a tolerance around
+a prediction depends on how the prediction was derived.
+
+### The dispersal leg partitions the whole line into three named regions
+
+| region | condition | outcome |
+|---|---|---|
+| `NON_DISPERSAL_BAND` | E(1) in 10-20 | PASSED, padding rows do not disperse |
+| `DISPERSAL_NEIGHBOURHOOD_PENDING_TOLERANCE` | E(1) around 119 | COULD_NOT_BE_CHECKED_MECHANICALLY, pending the architect |
+| `NEITHER_NEIGHBOURHOOD` | E(1) in neither | FAILED -- **neither prediction in the design holds** |
+
+The third region exists because a two-way test with an abstention bolted onto
+one arm files two different findings under one label. E(1) = 119.4 means "the
+dispersal reading looks right and we lack a tolerance". E(1) = 60 means
+"neither prediction in the design holds" -- a substantive result about the
+design, and the one nobody would go looking for if it were filed under a word
+meaning "we could not tell".
+
+Both discriminators are derived from the two anchors the design already states;
+no new number is introduced. A point outside the band is NEITHER when it is
+nearer the band than 119 -- it missed the only exactly stated criterion and is
+not even closer to the rival -- or when it is further from 119 than the two
+hypotheses are from each other, since a tolerance that wide would swallow the
+band whole and the two predictions would stop being distinguishable. Between
+those, the partition is deliberately conservative and returns PENDING: only a
+tolerance can settle it, and inventing one is the thing being avoided.
+
+**Distance to BOTH anchors is published on every result**, plus the gap between
+them. Distance to 119 alone cannot separate PENDING from NEITHER; the pair can,
+with no tolerance ruled at all.
+
+### A known bias in this leg, emitted in the output
+
+Only the non-dispersal hypothesis was given an exact band, so this leg can
+decisively confirm only non-dispersal -- the finding that leaves the ranking
+intact. Dispersal, which would damage it, can at best come back as pending. The
+gap runs in the direction the campaign would prefer, which is why it is
+escalated rather than logged, and why it is stated in the emitted
+`known_bias` field rather than only in a note somebody may not read.
 
 A capture that does not record whether padding rows were routed and counted
-cannot answer the padding question at all, and says so rather than answering it.
+cannot answer the padding question at all, and returns region `NOT_ESTABLISHED`
+rather than answering it.
 
 ## M1 -- `m1_profile.py`
 

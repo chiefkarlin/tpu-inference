@@ -30,10 +30,26 @@ the engineering manager and are gated on M4 actually running. This module emits
 
 ACCEPTANCE, FROM THE DESIGN. If E(32) is within 10% of 183 the byte model stands.
 If E(1) is 10-20, padding rows do not disperse. If E(1) is near 119, they do --
-but "near" has no tolerance in any document, so the dispersal leg reports
-COULD_NOT_BE_CHECKED_MECHANICALLY and publishes the distance from 119 until a
-named party supplies one. See ``m4.e1_disperse_tolerance_fraction`` in
-``thresholds.json``.
+but "near" has no tolerance in any document, and none is invented here. See
+``m4.e1_disperse_tolerance_fraction`` in ``thresholds.json``, which is null with
+the escalation recorded in its source field.
+
+THE DISPERSAL LEG PARTITIONS THE WHOLE LINE INTO THREE NAMED REGIONS, because a
+two-way test with an abstention bolted onto one arm files two different findings
+under one label. E(1) = 119.4 means "the dispersal reading looks right and we
+lack a tolerance". E(1) = 60 means "NEITHER prediction in the design holds",
+which is a substantive result about the design and the one nobody would go
+looking for if it were filed under a word meaning "we could not tell". Both
+distances -- to the band and to 119 -- are published on every result, because
+the distance to 119 alone cannot tell those two apart and the pair can, with no
+tolerance ruled at all.
+
+A KNOWN BIAS, STATED IN THE OUTPUT AND NOT ONLY IN THE NOTES. Only the
+non-dispersal hypothesis was given an exact band, so this leg can decisively
+confirm only non-dispersal -- the finding that leaves the ranking intact.
+Dispersal, which would damage it, can at best come back as pending. The gap runs
+in the direction the campaign would prefer, and it is escalated rather than
+logged.
 """
 
 from __future__ import annotations
@@ -41,6 +57,7 @@ from __future__ import annotations
 import argparse
 import collections
 import dataclasses
+import enum
 import statistics
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -198,63 +215,172 @@ def check_byte_model(capture: Capture, thresholds: common.Thresholds) -> common.
         intermediates)
 
 
+class DispersalRegion(str, enum.Enum):
+    """Where E(1) fell, as a name a reader can search for.
+
+    The design offers two neighbourhoods and the line has three regions. The
+    third one -- E(1) in NEITHER -- is a substantive result about the design
+    rather than a failure to measure, and it does not get to share a label with
+    "we lack a tolerance", or nobody will ever go looking for it.
+    """
+
+    NON_DISPERSAL_BAND = "NON_DISPERSAL_BAND"
+    DISPERSAL_NEIGHBOURHOOD = "DISPERSAL_NEIGHBOURHOOD"
+    DISPERSAL_PENDING_TOLERANCE = "DISPERSAL_NEIGHBOURHOOD_PENDING_TOLERANCE"
+    NEITHER_NEIGHBOURHOOD = "NEITHER_NEIGHBOURHOOD"
+    NOT_ESTABLISHED = "NOT_ESTABLISHED"
+
+
+#: The two hypotheses are 99 apart: 119 minus the band's upper edge of 20. That
+#: gap is not a tolerance and is not treated as one. It is used only for the
+#: one inference it genuinely supports: a tolerance around 119 wide enough to
+#: admit a point further away than the rival hypothesis itself would swallow
+#: the rival hypothesis whole, and the two predictions would stop being
+#: distinguishable. So beyond that distance, no tolerance anyone could rule
+#: would rescue the dispersal reading, and the region can be named without one.
+def _hypothesis_gap(band: Sequence[float], reference: float) -> float:
+    return abs(reference - max(band))
+
+
+def classify_dispersal(observed: float, band: Sequence[float],
+                       reference: float,
+                       tolerance: Optional[float]) -> DispersalRegion:
+    """The three-way partition of the whole line. No region is left unnamed.
+
+    Both discriminators are derived from the two anchors the design itself
+    states; no new number is introduced. A point outside the band is called
+    NEITHER when it is nearer the non-dispersal band than the dispersal anchor
+    -- it missed the only exactly stated criterion and is not even closer to
+    the other one -- or when it is further from 119 than the two hypotheses are
+    from each other.
+    """
+    if band[0] <= observed <= band[1]:
+        return DispersalRegion.NON_DISPERSAL_BAND
+
+    distance_to_reference = abs(observed - reference)
+    distance_to_band = min(abs(observed - band[0]), abs(observed - band[1]))
+
+    if (distance_to_band < distance_to_reference
+            or distance_to_reference > _hypothesis_gap(band, reference)):
+        return DispersalRegion.NEITHER_NEIGHBOURHOOD
+
+    if tolerance is None:
+        return DispersalRegion.DISPERSAL_PENDING_TOLERANCE
+    if distance_to_reference / reference <= tolerance:
+        return DispersalRegion.DISPERSAL_NEIGHBOURHOOD
+    return DispersalRegion.NEITHER_NEIGHBOURHOOD
+
+
 def check_padding_dispersal(capture: Capture,
                             thresholds: common.Thresholds) -> common.Check:
     """Do padding rows disperse across experts at c1?
 
-    The "do not disperse" leg has an exact band from the design. The "disperse"
-    leg says only "near 119", and no named party has supplied a tolerance for
-    it, so that leg reports UNDETERMINED with the distance published rather than
-    borrowing a tolerance that was designed for a different quantity.
+    A three-way partition, not a two-way test with an abstention bolted onto
+    one arm:
+
+      NON_DISPERSAL_BAND            E(1) inside the exactly stated band 10-20.
+                                    PASSED: padding rows do not disperse.
+      DISPERSAL_..._PENDING_TOLERANCE
+                                    E(1) in the neighbourhood of 119, which the
+                                    design states without a tolerance. No named
+                                    party has supplied one and none is invented,
+                                    so COULD_NOT_BE_CHECKED_MECHANICALLY.
+      NEITHER_NEIGHBOURHOOD         E(1) in neither. FAILED -- and note what
+                                    that means: not "the instrument failed" but
+                                    "neither hypothesis in the design holds",
+                                    which is a finding about the design.
+
+    THE DISTANCE TO BOTH ANCHORS IS ALWAYS PUBLISHED. Distance to 119 alone
+    cannot tell the second region from the third; distance to both can, with no
+    tolerance ruled at all.
+
+    A KNOWN BIAS IN THIS LEG, STATED IN THE OUTPUT AND NOT ONLY IN THE NOTES.
+    As the design specifies it, this leg can decisively CONFIRM only
+    non-dispersal -- the hypothesis that leaves the ranking intact -- because
+    only that hypothesis was given an exact band. Dispersal, the finding that
+    would damage the ranking, can at best be reported as pending. The gap runs
+    in the direction the campaign would prefer, and it is escalated rather than
+    logged.
     """
-    band = list(thresholds.require("m4.e1_no_disperse_band"))
+    band = [float(x) for x in thresholds.require("m4.e1_no_disperse_band")]
     reference = float(thresholds.require("m4.e1_disperse_reference"))
     observed = capture.summary_e()
+    tolerance_entry = thresholds.entry("m4.e1_disperse_tolerance_fraction")
     intermediates: Dict[str, Any] = {
         "observed_e": common.counted(observed, ROUTER_COUNTER),
         "no_disperse_band": band,
         "disperse_reference": reference,
+        "disperse_tolerance": tolerance_entry.to_dict(),
         "per_layer_e": {str(k): v for k, v in capture.per_layer_e().items()},
         "padding_rows_included": capture.padding_rows_included,
         "concurrency": capture.concurrency,
+        "known_bias":
+            "This leg can decisively confirm only NON-dispersal, because only "
+            "that hypothesis was given an exact band. Dispersal -- the finding "
+            "that would damage the ranking -- can at best come back as "
+            "pending. The asymmetry favours the comfortable answer.",
     }
     if observed is None:
+        intermediates["region"] = DispersalRegion.NOT_ESTABLISHED.value
         return common.check("m4.padding_dispersal", common.Outcome.UNDETERMINED,
-                            "the capture is empty", intermediates)
+                            "the capture is empty, so E(1) has no value; an "
+                            "empty input is undetermined and never a pass",
+                            intermediates)
+
     intermediates["distance_from_disperse_reference"] = observed - reference
     intermediates["relative_distance_from_disperse_reference"] = (
         abs(observed - reference) / reference)
+    intermediates["distance_from_no_disperse_band"] = (
+        0.0 if band[0] <= observed <= band[1]
+        else min(abs(observed - band[0]), abs(observed - band[1])))
+    intermediates["gap_between_the_two_hypotheses"] = _hypothesis_gap(
+        band, reference)
+
     if capture.padding_rows_included is not True:
+        intermediates["region"] = DispersalRegion.NOT_ESTABLISHED.value
         return common.check(
             "m4.padding_dispersal", common.Outcome.UNDETERMINED,
             "the capture does not record that padding rows were routed and "
-            "counted, and whether padding rows disperse is the question; "
-            "E is published above", intermediates)
-    if band[0] <= observed <= band[1]:
+            "counted, and whether padding rows disperse is the question; both "
+            "distances are published above but no region can be assigned",
+            intermediates)
+
+    tolerance = (None if tolerance_entry.value is None
+                 else float(tolerance_entry.value))
+    region = classify_dispersal(observed, band, reference, tolerance)
+    intermediates["region"] = region.value
+
+    if region is DispersalRegion.NON_DISPERSAL_BAND:
         return common.check(
             "m4.padding_dispersal", common.Outcome.PASSED,
-            f"E(1) = {observed:.2f} lies in the stated band {band}: padding rows "
-            "do NOT disperse", intermediates)
-    try:
-        tolerance = float(thresholds.require("m4.e1_disperse_tolerance_fraction"))
-    except common.ThresholdError as exc:
-        intermediates["threshold_status"] = str(exc)
-        return common.check(
-            "m4.padding_dispersal", common.Outcome.UNDETERMINED,
-            f"E(1) = {observed:.2f} is outside the stated band {band}, but 'near "
-            f"{reference}' has no tolerance from any named party and this module "
-            "does not invent one; the distance is published above", intermediates)
-    intermediates["disperse_tolerance_fraction"] = tolerance
-    if abs(observed - reference) / reference <= tolerance:
+            f"E(1) = {observed:.2f} lies in the stated band {band}: padding "
+            "rows do NOT disperse", intermediates)
+
+    if region is DispersalRegion.DISPERSAL_NEIGHBOURHOOD:
         return common.check(
             "m4.padding_dispersal", common.Outcome.PASSED,
             f"E(1) = {observed:.2f} is within {tolerance:.0%} of {reference}: "
-            "padding rows disperse", intermediates)
+            "padding rows DO disperse", intermediates)
+
+    if region is DispersalRegion.DISPERSAL_PENDING_TOLERANCE:
+        return common.check(
+            "m4.padding_dispersal", common.Outcome.UNDETERMINED,
+            f"E(1) = {observed:.2f} is outside the band {band} and sits in the "
+            f"neighbourhood of {reference}, but 'near {reference}' has no "
+            "tolerance from any named party and this module does not invent "
+            "one. PENDING A TOLERANCE, NOT UNMEASURABLE: both distances are "
+            "published and the ruling is outstanding with the architect",
+            intermediates)
+
     return common.check(
-        "m4.padding_dispersal", common.Outcome.UNDETERMINED,
-        f"E(1) = {observed:.2f} matches neither the band {band} nor "
-        f"{reference} +/- {tolerance:.0%}; this is a reportable finding, not a "
-        "value to be rounded to the nearer reference", intermediates)
+        "m4.padding_dispersal", common.Outcome.FAILED,
+        f"E(1) = {observed:.2f} is in NEITHER neighbourhood: it misses the "
+        f"stated band {band} and is not in the neighbourhood of {reference} "
+        "under any tolerance that would still tell the two hypotheses apart. "
+        "This is a finding about the design, not a failure of the instrument "
+        "-- neither prediction in section 7 holds -- and it is deliberately "
+        "not filed under the label that means 'we could not tell'",
+        intermediates)
 
 
 def ladder(captures: Iterable[Capture]) -> List[Dict[str, Any]]:
