@@ -1,0 +1,175 @@
+{
+  "_schema": "laguna-phase0-thresholds/1",
+  "_rules": [
+    "Every leaf is an object with value, kind and source. A leaf with no source is a bug.",
+    "kind=constant: fixed by a named party, not run-dependent.",
+    "kind=input: expected to be supplied or derived from a measurement before use.",
+    "kind=deliberately-absent: a threshold that a named party ruled must NOT exist. Emit the number, do not judge it.",
+    "kind=rejected: a value that appears in an upstream document and has been overruled. Never read it.",
+    "value=null means there is no default. The code raises at the point of use and the instrument reports COULD_NOT_BE_CHECKED_MECHANICALLY. It does not invent a number."
+  ],
+  "m0": {
+    "recompilation_events_allowed_in_window": {
+      "value": 0,
+      "kind": "constant",
+      "source": "optimization-design.md (pinned blob eb06a08f297f83938e9b90754bba47ad5e603606) section 7, M0",
+      "note": "A run that recompiles in-window is VOID, not adjusted. There is no adjusted path in this package."
+    },
+    "required_env": {
+      "value": {"VLLM_XLA_CHECK_RECOMPILATION": "1"},
+      "kind": "constant",
+      "source": "optimization-design.md section 7, M0",
+      "note": "Recorded into the warm-up evidence of every window so a third party can see it was set."
+    },
+    "recompilation_event_log_patterns": {
+      "value": null,
+      "kind": "input",
+      "source": "INSTRUMENT BINDING, NOT A THRESHOLD. Must be confirmed against a real server log before first use.",
+      "note": "Regexes that identify one recompilation event in the server log. Unconfirmed: no log from a warmed v7x pod has been read by the author of this file. Until supplied, and absent an in-process counter, M0 reports COULD_NOT_BE_CHECKED_MECHANICALLY rather than zero events."
+    }
+  },
+  "m2": {
+    "min_replicates": {
+      "value": 4,
+      "kind": "constant",
+      "source": "optimization-design.md section 7, M2 (>= 4 replicates, matching the H200 arm)",
+      "note": "Extended to c1 by review-1 (pinned blob e2b63034eb5df63de7fe53456f4c6b246cbb313d) section 4.2, finding B8."
+    },
+    "cells": {
+      "value": [
+        {"shape": "B", "isl": 512, "osl": 256, "concurrency": 32},
+        {"shape": "B", "isl": 512, "osl": 256, "concurrency": 1}
+      ],
+      "kind": "constant",
+      "source": "optimization-design.md section 7 M2 (c32); review-1 section 4.2 finding B8 (c1)"
+    }
+  },
+  "m3": {
+    "serving_stack_cost_threshold_ms": {
+      "value": null,
+      "kind": "input",
+      "source": "review-1 section 4.2, finding B8: the design's 1 ms threshold VIOLATES M2's own rule and is refused.",
+      "note": "Must be supplied from M2's measured spread at the same cell. There is no default and the developer did not invent one. Absent it, M3 emits the difference as an intermediate and reports COULD_NOT_BE_CHECKED_MECHANICALLY."
+    },
+    "design_stated_threshold_ms": {
+      "value": null,
+      "kind": "rejected",
+      "source": "optimization-design.md section 7 M3 stated 1 ms; overruled by review-1 finding B8",
+      "note": "Recorded for traceability only. Held at null so that no code path can read it."
+    }
+  },
+  "m4": {
+    "concurrencies": {
+      "value": [1, 16, 32],
+      "kind": "constant",
+      "source": "optimization-design.md section 7, M4"
+    },
+    "e32_reference": {
+      "value": 183,
+      "kind": "constant",
+      "source": "optimization-design.md section 7, M4 (byte model stands if E(32) is within 10% of 183)"
+    },
+    "e32_tolerance_fraction": {
+      "value": 0.10,
+      "kind": "constant",
+      "source": "optimization-design.md section 7, M4"
+    },
+    "e1_disperse_reference": {
+      "value": 119,
+      "kind": "constant",
+      "source": "optimization-design.md section 7, M4 (E(1) near 119 => padding rows disperse)"
+    },
+    "e1_no_disperse_band": {
+      "value": [10, 20],
+      "kind": "constant",
+      "source": "optimization-design.md section 7, M4 (E(1) of 10-20 => padding rows do not disperse)"
+    }
+  },
+  "m6": {
+    "per_chip_hbm_bandwidth_gbytes_per_s": {
+      "value": 7380.0,
+      "kind": "constant",
+      "source": "brief section C and optimization-design.md section 7 M6 -- the PER-CHIP row of the v7x table",
+      "note": "Cite the row, not the value. This is per chip. The per-device figure is half of it and pairing the two bases is the fault M6 leg 2 exists to catch."
+    },
+    "per_chip_dense_bf16_tflops": {
+      "value": 2307.0,
+      "kind": "constant",
+      "source": "brief section C and optimization-design.md section 7 M6 -- the PER-CHIP row of the v7x table",
+      "note": "Per chip. Per device is half."
+    },
+    "devices_per_chip": {
+      "value": 2,
+      "kind": "constant",
+      "source": "brief section C: a v7x chip is two chiplets, which is two TensorCores, which is two JAX devices. The runtime device is the chiplet.",
+      "note": "The device count is twice the chip count. Never derive a chip count from the startup banner's chip-count field: it reports devices."
+    },
+    "max_tensor_parallel_size": {
+      "value": 8,
+      "kind": "constant",
+      "source": "brief section C: TP=16 is prohibited; TP=8 is 4 chips and is the ceiling because num_key_value_heads is 8"
+    },
+    "ridge_relative_tolerance": {
+      "value": 1e-09,
+      "kind": "constant",
+      "source": "NOT A DESIGNED THRESHOLD. Floating-point equality epsilon for recomputing the ridge point from the pinned pair.",
+      "note": "An inconsistent pairing moves the ridge by a factor of two, so no measurement-derived tolerance is needed to separate it from a rounding difference."
+    }
+  },
+  "m1": {
+    "idle_definition": {
+      "value": "strict",
+      "kind": "constant",
+      "source": "architect ruling, via brief section E6",
+      "note": "STRICT: a gap on the device timeline with no kernel executing AND no DMA in flight. The thresholds below stand because they stand on the strict definition. Do not loosen it."
+    },
+    "f_host_holds_at_or_above": {
+      "value": 0.45,
+      "kind": "input",
+      "source": "architect judgement, via brief section E6 Rule 1",
+      "note": "f_host = I_strict / S, a fraction. A threshold expressed in the units of the thing being changed is not a threshold."
+    },
+    "f_host_refuted_at_or_below": {
+      "value": 0.12,
+      "kind": "input",
+      "source": "architect judgement, via brief section E6 Rule 1",
+      "note": "Between the two bounds is MIXED, a defined first-class branch, never resolved into the nearer extreme."
+    },
+    "e_dec_byte_bound_ratio": {
+      "value": 0.85,
+      "kind": "input",
+      "source": "architect judgement, via brief section E6 Rule 2",
+      "note": "Basis recorded because a reader is entitled to weigh it: 0.85 is judgement, not derived from a measurement. What is principled is the ratio-to-reference form, not the number."
+    },
+    "e_dec_efficiency_deficit_ratio": {
+      "value": 0.60,
+      "kind": "input",
+      "source": "architect judgement, via brief section E6 Rule 2",
+      "note": "Same basis as 0.85. A revision to either costs a parameter, by design."
+    },
+    "e_ref_plausibility_floor": {
+      "value": 0.50,
+      "kind": "input",
+      "source": "architect, via brief section E6 Rule 2",
+      "note": "If the measured reference efficiency comes back below this, Rule 2 is VOID rather than applied, and that is itself the finding."
+    },
+    "reference_step_ms": {
+      "value": {"1": 9.41, "16": 13.72, "32": 18.75},
+      "kind": "constant",
+      "source": "brief section E6 Rule 1 table",
+      "note": "REFERENCE ONLY. Not used in any verdict in this package. S is measured, and the decision is taken on the fraction I/S."
+    },
+    "closure_residual_threshold": {
+      "value": null,
+      "kind": "deliberately-absent",
+      "source": "brief section E6a: 'No threshold is attached to this and you must not invent one. Emit the number.'",
+      "note": "Held here as an explicit absence so that a future reader can see the gap was ruled, not overlooked."
+    },
+    "bucket_overlap_threshold": {
+      "value": null,
+      "kind": "deliberately-absent",
+      "source": "brief section E6a",
+      "note": "Overlap is reported, not judged. Closure is necessary and not sufficient: overlapping buckets can sum to S while describing the step wrongly."
+    }
+  }
+}
