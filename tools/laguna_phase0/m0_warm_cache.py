@@ -252,6 +252,20 @@ class WarmupEvidence:
     window_started_utc: Optional[str] = None
     window_ended_utc: Optional[str] = None
     environment: Dict[str, Any] = dataclasses.field(default_factory=dict)
+    absent_keys: List[str] = dataclasses.field(default_factory=list)
+    """Keys that were MISSING from the source document, when there was one.
+
+    Only :func:`evidence_from_dict` can populate this. An object built by
+    :class:`WarmupLedger` during a real run has every field by construction, so
+    its list is empty -- and empty here means "nothing was missing", never "we
+    did not look".
+
+    It exists because ``dict.get(key, default)`` destroys the difference
+    between "the harness said zero" and "the harness did not say", and
+    :func:`evaluate_window` needs that difference to decide whether it is
+    looking at a measurement or at a hole. The list is published in the check's
+    intermediates so a reader can see which distinction was drawn and why.
+    """
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -345,18 +359,50 @@ def evaluate_window(evidence: WarmupEvidence,
 
     warmed = {Bucket(**w["bucket"]) for w in evidence.warmed}
     missing = sorted(b.key() for b in evidence.plan.window_buckets if b not in warmed)
-    checks.append(
-        common.check(
-            "m0.buckets_warmed",
-            common.Outcome.FAILED if missing else common.Outcome.PASSED,
-            (f"the window uses buckets that were never warmed: {missing}")
-            if missing else "every bucket the window uses was warmed first",
-            {
-                "window_buckets": [b.key() for b in evidence.plan.window_buckets],
-                "warmed_buckets": sorted(b.key() for b in warmed),
-                "unwarmed_buckets_in_window": missing,
-                "warmth_identity": evidence.identity,
-            }))
+    warmth_intermediates = {
+        "window_buckets": [b.key() for b in evidence.plan.window_buckets],
+        "warmed_buckets": sorted(b.key() for b in warmed),
+        "unwarmed_buckets_in_window": missing,
+        "warmth_identity": evidence.identity,
+        "absent_keys": list(evidence.absent_keys),
+    }
+
+    # THE VACUOUS PASS, AND THE TWO WAYS TO REACH IT. "Every bucket the window
+    # uses was warmed" is trivially true when the window is not known to use
+    # any bucket, and a trivial truth is not a measurement. Reaching it by a
+    # missing key and reaching it by an empty list are different facts about
+    # the harness, so they get different reasons, but neither is a pass.
+    undecidable = None
+    if "plan" in evidence.absent_keys:
+        undecidable = ("the evidence document carries no plan at all, so there is no "
+                       "statement of which buckets the timed window uses. This is not "
+                       "a window that uses no buckets; it is a document that does not "
+                       "say, and it cannot be read as warm")
+    elif "plan.window_buckets" in evidence.absent_keys:
+        undecidable = ("the plan does not list the buckets the timed window uses, so "
+                       "there is nothing to check warmth against. Absent is not empty")
+    elif not evidence.plan.window_buckets:
+        undecidable = ("the plan declares that the timed window uses no buckets at "
+                       "all. Nothing was checked, because there is nothing this check "
+                       "could be about -- which is a statement about the plan, not a "
+                       "clean warm-up")
+    elif "warmed_buckets" in evidence.absent_keys:
+        undecidable = ("the evidence document does not record what was warmed. That "
+                       "is not the same as recording that nothing was warmed, and it "
+                       "must not be reported as an unwarmed window")
+
+    if undecidable is not None:
+        checks.append(
+            common.check("m0.buckets_warmed", common.Outcome.UNDETERMINED,
+                         undecidable, warmth_intermediates))
+    else:
+        checks.append(
+            common.check(
+                "m0.buckets_warmed",
+                common.Outcome.FAILED if missing else common.Outcome.PASSED,
+                (f"the window uses buckets that were never warmed: {missing}")
+                if missing else "every bucket the window uses was warmed first",
+                warmth_intermediates))
 
     start = evidence.window_start_counter
     end = evidence.window_end_counter
@@ -401,8 +447,44 @@ def window_verdict(checks: Sequence[common.Check]) -> WindowVerdict:
 
 
 def evidence_from_dict(data: Dict[str, Any]) -> WarmupEvidence:
-    """Rebuilds evidence written by a harness, for offline evaluation."""
-    plan_data = data.get("plan", {})
+    """Rebuilds evidence written by a harness, for offline evaluation.
+
+    RECORDS WHAT WAS MISSING INSTEAD OF FILLING IT IN. The defaults below are
+    still applied, because the rest of the module wants real lists to iterate;
+    what changed is that supplying a default is no longer silent. Every key
+    that had to be defaulted is named in :attr:`WarmupEvidence.absent_keys`,
+    and :func:`evaluate_window` refuses to draw a conclusion from a defaulted
+    one.
+
+    The defect this closes: ``data.get("plan", {})`` turned an evidence
+    document with no plan into a plan with no buckets, and a window that uses
+    no buckets has no unwarmed buckets, so the warmth check reported PASSED
+    with the words "every bucket the window uses was warmed first". A document
+    that said nothing about warming was being read as proof of warming.
+
+    Note the two directions, because only one of them is tempting to leave
+    alone. Absent ``plan`` flattered the run; absent ``warmed_buckets``
+    condemned it, by reading "the document does not say what was warmed" as
+    "nothing was warmed". BOTH ARE THE SAME BUG and both are fixed here. A
+    check that is wrong in the safe direction is still wrong, and it sends an
+    operator hunting a cache fault that never happened.
+
+    This function is NOT a validator and does not decide anything. It parses,
+    and it reports what it could not find. Deciding is
+    :func:`evaluate_window`'s job, which is why a missing key produces an
+    UNDETERMINED verdict rather than an exception: the file is readable, the
+    instrument ran, and "the evidence does not decide" is a result. Exit status
+    2 stays reserved for could-not-run, per :func:`main`.
+    """
+    absent: List[str] = []
+    if "plan" not in data:
+        absent.append("plan")
+    plan_data = data.get("plan", {}) or {}
+    if "plan" not in absent and "window_buckets" not in plan_data:
+        absent.append("plan.window_buckets")
+    if "warmed_buckets" not in data:
+        absent.append("warmed_buckets")
+
     plan = WarmupPlan(
         window_buckets=[Bucket(**b) for b in plan_data.get("window_buckets", [])],
         leave_unwarmed=[Bucket(**b) for b in plan_data.get("leave_unwarmed", [])])
@@ -423,7 +505,8 @@ def evidence_from_dict(data: Dict[str, Any]) -> WarmupEvidence:
         window_end_counter=reading(data.get("recompilation_counter_at_window_end")),
         window_started_utc=data.get("window_started_utc"),
         window_ended_utc=data.get("window_ended_utc"),
-        environment=data.get("environment", {}))
+        environment=data.get("environment", {}),
+        absent_keys=absent)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

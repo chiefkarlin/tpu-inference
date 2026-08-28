@@ -268,3 +268,162 @@ def test_evidence_that_is_not_json_exits_two_and_not_one():
         evidence_path.write_text("this is not json", encoding="utf-8")
         assert m0.main(["evaluate", "--evidence", str(evidence_path),
                         "--out", str(root / "m0.json")]) == 2
+
+
+# --- C2 / R7 decidable half: absent is not empty, and empty is not a pass ---
+#
+# THE ENUMERATION THE BRIEF ASKED FOR, BEFORE THE COERCION MOVED. Across the
+# whole owned tree there is exactly ONE definition of `evidence_from_dict`
+# (m0_warm_cache.py:403) and exactly ONE call site (m0_warm_cache.py:487, the
+# `evaluate` arm of main). Nothing else in the package or the tree calls it.
+#
+# THE MORE INTERESTING HALF OF THAT ENUMERATION IS WHAT DOES *NOT* APPEAR IN
+# IT. Every test above builds a `WarmupEvidence` by calling the constructor
+# directly through `build_evidence`. NOT ONE of them reaches the function
+# whose coercion is the defect. The suite could therefore never have caught
+# this, no matter how thorough it was about `evaluate_window`, because the
+# coercion sits on a path the suite does not use. That is the shape to look
+# for elsewhere: a parser that only production traffic exercises, guarded by
+# tests that hand-build the parsed object.
+
+
+def _document(**overrides):
+    """A minimally valid on-disk evidence document, with keys removable.
+
+    Built by round-tripping a real ledger-shaped object so the baseline is
+    something the emitter could actually produce, rather than a hand-written
+    dict that agrees with my reading of the format. Pass a key with value
+    `_ABSENT` to delete it.
+    """
+    doc = build_evidence(warmed=BUCKETS, start=7, end=7).to_dict()
+    for key, value in overrides.items():
+        if value is _ABSENT:
+            doc.pop(key, None)
+        else:
+            doc[key] = value
+    return doc
+
+
+_ABSENT = object()
+
+
+def _named(checks, name):
+    return next(c for c in checks if c.name == name)
+
+
+def test_an_evidence_document_with_no_plan_does_not_vacuously_pass():
+    """THE DEFECT. A document with no plan at all reported every bucket warmed.
+
+    `data.get("plan", {})` made an absent plan into an empty plan, and an empty
+    plan has no unwarmed buckets, so `missing` was empty and the check said
+    PASSED with the words "every bucket the window uses was warmed first". The
+    window could then be VALID and main could exit 0.
+
+    ABSENCE OF EVIDENCE WAS BEING REPORTED AS EVIDENCE OF WARMTH, which is the
+    flattering direction, and it is reachable from any harness that fails to
+    write the plan -- exactly the harness most likely to have got other things
+    wrong too.
+    """
+    evidence = m0.evidence_from_dict(_document(plan=_ABSENT))
+    check = _named(m0.evaluate_window(evidence, thresholds()), "m0.buckets_warmed")
+    assert check.outcome is common.Outcome.UNDETERMINED
+    assert "plan" in check.intermediates.get("absent_keys", [])
+
+
+def test_an_absent_window_bucket_list_is_not_an_empty_one():
+    """The same coercion one level down, where the plan exists but is hollow."""
+    evidence = m0.evidence_from_dict(_document(plan={"leave_unwarmed": []}))
+    check = _named(m0.evaluate_window(evidence, thresholds()), "m0.buckets_warmed")
+    assert check.outcome is common.Outcome.UNDETERMINED
+    assert "plan.window_buckets" in check.intermediates.get("absent_keys", [])
+
+
+def test_an_explicitly_empty_window_is_undetermined_and_not_a_pass():
+    """Present-but-empty is a different fact from absent, and neither passes.
+
+    This one is NOT a parse defect -- the document says what it means. It is
+    still not a pass: "every bucket the window uses was warmed" is vacuously
+    true of a window that uses none, and a vacuous truth is not a measurement.
+    Kept separate from the absent case so the two cannot be conflated, and the
+    reason text has to distinguish them.
+    """
+    evidence = m0.evidence_from_dict(
+        _document(plan={"window_buckets": [], "leave_unwarmed": []}))
+    check = _named(m0.evaluate_window(evidence, thresholds()), "m0.buckets_warmed")
+    assert check.outcome is common.Outcome.UNDETERMINED
+    assert "absent_keys" not in check.intermediates or not [
+        k for k in check.intermediates["absent_keys"] if "window_buckets" in k]
+
+
+def test_an_absent_warmed_list_is_undetermined_and_not_a_failure():
+    """The same defect pointing the OTHER way, and it is still a defect.
+
+    `data.get("warmed_buckets", [])` turned "the document does not say what was
+    warmed" into "nothing was warmed", which reports FAILED. That direction is
+    unflattering, so it is tempting to leave alone -- but a check that is wrong
+    in the safe direction is still wrong, and an operator who gets VOID for a
+    missing key will go looking for a cache problem that does not exist.
+
+    Present-and-empty still FAILS, immediately below, so this does not weaken
+    the check; it separates two facts that were being reported as one.
+    """
+    evidence = m0.evidence_from_dict(_document(warmed_buckets=_ABSENT))
+    check = _named(m0.evaluate_window(evidence, thresholds()), "m0.buckets_warmed")
+    assert check.outcome is common.Outcome.UNDETERMINED
+    assert "warmed_buckets" in check.intermediates.get("absent_keys", [])
+
+
+def test_an_explicitly_empty_warmed_list_still_fails():
+    """THE NEGATIVE CONTROL ON THE FIX ABOVE.
+
+    If this went UNDETERMINED too, the previous test would have bought its
+    result by disabling the detector rather than by sharpening it. A document
+    that positively asserts nothing was warmed, for a window that uses buckets,
+    is a VOID window and must stay FAILED.
+    """
+    evidence = m0.evidence_from_dict(_document(warmed_buckets=[]))
+    check = _named(m0.evaluate_window(evidence, thresholds()), "m0.buckets_warmed")
+    assert check.outcome is common.Outcome.FAILED
+
+
+def test_a_complete_document_still_passes_through_the_parser():
+    """THE SECOND NEGATIVE CONTROL: the parser must not have become a wall.
+
+    Every test above asserts something stopped being a pass. Without this one
+    they are all satisfied by a parser that refuses everything, which is the
+    constant-1 failure the P1 item was reopened over -- the same defect with a
+    louder failure mode.
+    """
+    evidence = m0.evidence_from_dict(_document())
+    checks = m0.evaluate_window(evidence, thresholds())
+    assert _named(checks, "m0.buckets_warmed").outcome is common.Outcome.PASSED
+    assert m0.window_verdict(checks) is m0.WindowVerdict.VALID
+
+
+def test_a_document_with_no_plan_does_not_exit_zero():
+    """The end-to-end consequence, at the exit code, through main.
+
+    The unit assertions above are about a check object. This is about what an
+    operator's shell sees, which is the thing that actually gates a run.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        path = root / "evidence.json"
+        path.write_text(json.dumps(_document(plan=_ABSENT)), encoding="utf-8")
+        assert m0.main(["evaluate", "--evidence", str(path),
+                        "--out", str(root / "m0.json")]) == 1
+
+
+def test_the_round_trip_a_real_harness_performs_is_unaffected():
+    """Evidence written by the ledger and read back must be untouched by this.
+
+    The fix adds a notion of "absent" that only the parser can produce. A
+    ledger-built object has every field, so its absent-key list must be empty
+    and its verdict identical to the direct-construction path. If this ever
+    fails, the parser and the emitter have drifted apart.
+    """
+    direct = build_evidence(warmed=BUCKETS, start=7, end=7)
+    round_tripped = m0.evidence_from_dict(json.loads(json.dumps(direct.to_dict())))
+    assert round_tripped.absent_keys == []
+    assert (m0.window_verdict(m0.evaluate_window(round_tripped, thresholds()))
+            is m0.window_verdict(m0.evaluate_window(direct, thresholds())))
